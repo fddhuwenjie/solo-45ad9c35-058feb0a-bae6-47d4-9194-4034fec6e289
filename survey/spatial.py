@@ -120,13 +120,23 @@ def aggregate_points(measurements, expected_freqs, ref_freq, bounds, dup_eps=0.5
     return points
 
 
+def issue_label(code):
+    """'missing-freq:4000,5000' -> '频点缺失(4000,5000)'。"""
+    k, _, arg = code.partition(":")
+    t = ISSUE_TEXT.get(k, k)
+    return t + ("(" + arg + ")" if arg else "")
+
+
 def compute_grid(points, zones, limits, bounds, prev_cells=None, affected=None):
     """计算覆盖网格。
 
     prev_cells + affected:增量重算——仅重算 affected 中的格子,其余沿用 prev_cells。
     返回 (cells, grid_meta)。status 取值:
       ok / warn(临近干扰) / fail(限值不合格) / nodata(证据不足) /
-      noconclusion(校准版本混用,不得下结论) / notest(禁测区)
+      noconclusion(校准版本混用或含无效测点,不得下结论) / notest(禁测区)
+
+    无效测点(坐标越界、频点缺失、重复测点等)不参与插值,但其影响半径内的
+    网格同样不得输出结论——即使附近另有足够有效测点,也一律 noconclusion。
     """
     cs = float(limits["cell_size"])
     R = float(limits["influence_radius"])
@@ -137,6 +147,8 @@ def compute_grid(points, zones, limits, bounds, prev_cells=None, affected=None):
     notest = [z["polygon"] for z in zones if z["kind"] == "notest"]
     inter = [z["polygon"] for z in zones if z["kind"] == "interference"]
     usable = [p for p in points if p["valid"] and not p["excluded"] and p["metrics"]]
+    # 未排除的无效测点:数据质量存疑,污染其影响半径内的所有网格结论
+    tainted = [p for p in points if not p["excluded"] and (not p["valid"] or not p["metrics"])]
     prev = {(c["cx"], c["cy"]): c for c in (prev_cells or [])}
 
     cells = []
@@ -160,7 +172,14 @@ def compute_grid(points, zones, limits, bounds, prev_cells=None, affected=None):
                 contrib = [(p, math.hypot(p["x"] - x, p["y"] - y)) for p in usable]
                 contrib = [(p, d) for p, d in contrib if d <= R]
                 cell["n"] = len(contrib)
-                if len(contrib) < min_pts:
+                near_bad = [p for p in tainted
+                            if math.hypot(p["x"] - x, p["y"] - y) <= R]
+                if near_bad:
+                    cell["status"] = "noconclusion"
+                    cell["reason"] = "含无效测点:" + ";".join(
+                        "%s(%s)" % (p["label"], ",".join(issue_label(i) for i in p["issues"]) or "数据不可用")
+                        for p in near_bad)
+                elif len(contrib) < min_pts:
                     cell["status"] = "nodata"
                     cell["reason"] = "证据不足:有效测点 %d/%d" % (len(contrib), min_pts)
                 else:

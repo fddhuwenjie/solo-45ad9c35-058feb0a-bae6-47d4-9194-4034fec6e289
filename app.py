@@ -575,6 +575,11 @@ def export_recalc(vid):
         return json_error("版本不存在", 404)
     state = build_state(conn, ver["project_id"], vid)
     _, order, total = _path_for(conn, vid)
+    # manual_decisions 按版本隔离:只导出本版产生的决定,不带入其他版本
+    decisions = rows(conn,
+                     "SELECT * FROM decisions WHERE version_id=? ORDER BY id", (vid,))
+    for d in decisions:
+        d["payload"] = json.loads(d.pop("payload_json"))
     conn.close()
     payload = {
         "project": {"id": state["project"]["id"], "name": state["project"]["name"],
@@ -583,7 +588,7 @@ def export_recalc(vid):
                     "created_at": ver["created_at"]},
         "limits": state["limits"],
         "calibration_summary": state["version"]["calibration_summary"],
-        "manual_decisions": state["decisions"],
+        "manual_decisions": decisions,
         "validation_issues": [
             {"point_label": p["label"], "issues": p["issues"]}
             for p in state["points"] if not p["valid"]],
