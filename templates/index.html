@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>助听感应环巡测校审</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>助听感应环巡测校审</h1>
+  <span id="projName" class="proj"></span>
+  <span id="calibBadge" class="badge"></span>
+  <div class="spacer"></div>
+  <label class="hdr">版本</label>
+  <select id="versionSelect"></select>
+  <button id="btnExportSvg" title="导出覆盖 SVG">覆盖 SVG</button>
+  <button id="btnExportCsv" title="导出补测清单 CSV">补测清单</button>
+  <button id="btnExportJson" title="导出复算 JSON">复算 JSON</button>
+</header>
+
+<div id="setup" class="hidden">
+  <div class="setup-card">
+    <h2>新建巡测项目</h2>
+    <p>上传剧场座位图 SVG(viewBox 单位视为米),随后导入巡测 CSV。</p>
+    <label>项目名称 <input id="setupName" value="示例剧场"></label>
+    <label>场地 SVG <input id="setupSvg" type="file" accept=".svg,image/svg+xml"></label>
+    <button id="btnCreate">创建项目</button>
+    <p class="hint">CSV 列:point_id,x,y,freq_hz,field_db,noise_db[,device_id,calib_version]</p>
+  </div>
+</div>
+
+<main id="main" class="hidden">
+  <aside id="left">
+    <section class="panel">
+      <h3>数据导入</h3>
+      <input id="csvFile" type="file" accept=".csv,text/csv">
+      <input id="csvLabel" placeholder="版本标签,如:满场复测">
+      <button id="btnImport">导入 CSV(生成新版本)</button>
+      <div id="importMsg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h3>工具</h3>
+      <div class="tools">
+        <button data-tool="select" class="tool active">选择/拖动</button>
+        <button data-tool="pan" class="tool">平移</button>
+        <button data-tool="audience" class="tool">圈观众区</button>
+        <button data-tool="notest" class="tool">圈禁测区</button>
+        <button data-tool="interference" class="tool">标干扰设备</button>
+      </div>
+      <div id="polyBar" class="hidden">
+        <input id="zoneName" placeholder="分区名称">
+        <button id="btnPolyDone">完成</button>
+        <button id="btnPolyCancel">取消</button>
+      </div>
+      <p class="hint">滚轮缩放;多边形工具下单击加点、双击或“完成”闭合;选择工具下可拖动误定位测点。</p>
+    </section>
+
+    <section class="panel">
+      <h3>校核限值 <button id="btnSaveLimits" class="mini">保存并重算</button></h3>
+      <div class="limits" id="limitsForm">
+        <label>场强下限 dB<input data-k="field_min" type="number" step="0.5"></label>
+        <label>场强上限 dB<input data-k="field_max" type="number" step="0.5"></label>
+        <label>均匀度 ≤ dB<input data-k="uniformity_db" type="number" step="0.5"></label>
+        <label>信噪比 ≥ dB<input data-k="snr_min" type="number" step="0.5"></label>
+        <label>频响偏差 ≤ dB<input data-k="freq_dev_db" type="number" step="0.5"></label>
+        <label>参考频点 Hz<input data-k="ref_freq" type="number" step="100"></label>
+        <label>期望频点 Hz<input data-k="expected_freqs"></label>
+        <label>网格边长 m<input data-k="cell_size" type="number" step="0.5" min="0.5"></label>
+        <label>影响半径 m<input data-k="influence_radius" type="number" step="0.5" min="1"></label>
+        <label>最少测点数<input data-k="min_points" type="number" step="1" min="1"></label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>分区</h3>
+      <ul id="zoneList" class="list"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>测点 <span id="pointCount" class="dim"></span></h3>
+      <ul id="pointList" class="list scroll"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>人工决定记录</h3>
+      <ul id="decisionList" class="list scroll small"></ul>
+    </section>
+  </aside>
+
+  <section id="viewportWrap">
+    <svg id="viewport" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="legend"></div>
+    <div id="tooltip" class="hidden"></div>
+    <div id="statusbar">就绪</div>
+  </section>
+
+  <aside id="right">
+    <section class="panel" id="detailPanel">
+      <h3>选中对象</h3>
+      <div id="detail"><p class="dim">点击测点或网格查看详情</p></div>
+    </section>
+    <section class="panel">
+      <h3>频响曲线 <span id="spectrumTitle" class="dim"></span></h3>
+      <svg id="spectrum" viewBox="0 0 340 230"></svg>
+    </section>
+    <section class="panel">
+      <h3>覆盖统计</h3>
+      <div id="stats"></div>
+    </section>
+    <section class="panel grow">
+      <h3>补测路径 <button id="btnPath" class="mini">规划最短路径</button></h3>
+      <div id="pathInfo" class="msg"></div>
+      <ol id="pathList" class="list scroll small"></ol>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
