@@ -127,7 +127,11 @@ def point_at_s(verts, ss, s):
 
 
 def project_to_path(x, y, verts, ss):
-    """点到折线的投影,返回 (里程 s, 垂直距离 d)。"""
+    """点到折线的投影,返回 (里程 s, 垂直距离 d, 落段索引 seg)。
+
+    测点可能在空间上靠近折线的另一支路(U 形两臂),但沿路径里程很远;
+    调用方须同时用垂距与里程差(展开距离)隔离这类样本。
+    """
     best = None
     for i in range(1, len(verts)):
         ax, ay = verts[i - 1]
@@ -140,7 +144,7 @@ def project_to_path(x, y, verts, ss):
         d = math.hypot(x - px, y - py)
         s = ss[i - 1] + t * math.sqrt(seg2)
         if best is None or d < best[1]:
-            best = (s, d)
+            best = (s, d, i - 1)
     return best
 
 
@@ -324,12 +328,15 @@ def evaluate_path(path, pairs, ambiguous, on_pts, off_pts, zones, params):
               "in_adjacent": any(point_in_poly(x, y, p) for p in adj_polys),
               "status": "ok", "reasons": []}
 
-        near_ok = [(p, pr[0], pr[1]) for (p, pr) in proj_ok
-                   if math.hypot(p["x"] - x, p["y"] - y) <= R]
-        near_bad = [p for (p, pr) in proj_bad
-                    if math.hypot(p["x"] - x, p["y"] - y) <= R]
-        near_amb = [(a, q) for (a, q, pr) in amb_proj
-                    if math.hypot(q["x"] - x, q["y"] - y) <= R]
+        # 取点范围:垂距与沿路径里程差都必须 <= 影响半径。
+        # 仅按欧氏距离会把 U 形另一支路(空间近、沿线远)的样本混入本站。
+        def along(pr, s):
+            ps, pd = pr[0], pr[1]
+            return abs(pd) <= R + EPS and abs(ps - s) <= R + EPS
+
+        near_ok = [(p, pr[0], pr[1]) for (p, pr) in proj_ok if along(pr, s)]
+        near_bad = [p for (p, pr) in proj_bad if along(pr, s)]
+        near_amb = [(a, q) for (a, q, pr) in amb_proj if along(pr, s)]
 
         # 无结论原因叠加(可多重)
         for p in near_bad:
@@ -346,12 +353,13 @@ def evaluate_path(path, pairs, ambiguous, on_pts, off_pts, zones, params):
             if span is not None and span > params["max_sample_gap"] + EPS:
                 st["reasons"].append("sample-gap")
 
-        # 有有效配对时仍插值给出参考值(无结论站在曲线上画虚点)
+        # 有有效配对时仍插值给出参考值(无结论站在曲线上画虚点)。
+        # IDW 权重用展开距离 sqrt(垂距² + 里程差²),而非直线欧氏距离。
         if near_ok:
-            on_v = _idw([(p["on_field"], math.hypot(p["x"] - x, p["y"] - y))
-                         for p, _, _ in near_ok])
-            bg_v = _idw([(p["off_field"], math.hypot(p["x"] - x, p["y"] - y))
-                         for p, _, _ in near_ok])
+            weights = [(p, max(math.sqrt(pd ** 2 + (s - ps) ** 2), EPS))
+                       for p, ps, pd in near_ok]
+            on_v = _idw([(p["on_field"], d) for p, d in weights])
+            bg_v = _idw([(p["off_field"], d) for p, d in weights])
             st["on_field"] = round(on_v, 2)
             st["background"] = round(bg_v, 2)
             st["excess"] = round(on_v - bg_v, 2)
@@ -360,6 +368,8 @@ def evaluate_path(path, pairs, ambiguous, on_pts, off_pts, zones, params):
 
         if st["in_own"]:
             st["status"] = "internal"           # 本环服务区内部不评外逸
+        elif self_cross:
+            st["status"] = "noconclusion"        # 路径自交:里程投影不唯一,全线无结论
         elif not near_ok and not near_bad and not near_amb:
             st["status"] = "nodata"
             st["reasons"].append("no-pair")

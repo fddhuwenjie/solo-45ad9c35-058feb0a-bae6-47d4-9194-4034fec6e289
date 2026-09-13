@@ -123,7 +123,9 @@ def parse_leak_csv(text):
             errors.append("第 %d 行: 数值列无法解析" % ln)
             continue
         if label in seen:
-            errors.append("第 %d 行: 测点 %s 重复(一次测次中每点仅允许一条读数)" % (ln, label))
+            errors.append("第 %d 行: 测点 %s 重复(一次测次中每点仅允许一条读数),该行已跳过"
+                          % (ln, label))
+            continue
         seen.add(label)
         rows.append(r)
     return rows, errors

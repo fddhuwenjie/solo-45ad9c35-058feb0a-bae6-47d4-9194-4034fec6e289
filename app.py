@@ -1147,6 +1147,13 @@ def log_leak_event(conn, lid, kind, payload, revision=None):
     conn.commit()
 
 
+def bump_leak_revision(conn, lid):
+    """人工改配/调边界顶点/移点成功后生成并切换到新修订,返回新修订号。"""
+    conn.execute("UPDATE leak_surveys SET revision=revision+1 WHERE id=?", (lid,))
+    conn.commit()
+    return row(conn, "SELECT revision FROM leak_surveys WHERE id=?", (lid,))["revision"]
+
+
 def recompute_leak(conn, lid):
     """按当前测次/配对表(含人工改配)/限值/边界重算,写 result_json。"""
     surv = get_leak(conn, lid)
@@ -1397,11 +1404,12 @@ def move_leak_point(lid):
         return json_error("测点不存在: " + label, 404)
     conn.execute("UPDATE leak_points SET x=?,y=?,moved=1 WHERE id=?", (x, y, pt["id"]))
     conn.commit()
+    new_rev = bump_leak_revision(conn, lid)
     recompute_leak(conn, lid)
     log_leak_event(conn, lid, "move", {
         "condition": condition, "point_label": label,
         "from": [pt["x"], pt["y"]], "to": [x, y], "note": note},
-        revision=surv["revision"])
+        revision=new_rev)
     state = leak_state(conn, lid)
     conn.close()
     return jsonify(state)
@@ -1566,10 +1574,11 @@ def edit_leak_path(pid):
         conn.close()
         return json_error("未知 action(vertices/split)")
     conn.commit()
+    new_rev = bump_leak_revision(conn, p["survey_id"])
     recompute_leak(conn, p["survey_id"])
     log_leak_event(conn, p["survey_id"],
                    "path-edit" if action == "vertices" else "path-split", payload,
-                   revision=surv["revision"])
+                   revision=new_rev)
     state = leak_state(conn, p["survey_id"])
     conn.close()
     return jsonify(state)
@@ -1616,10 +1625,11 @@ def add_leak_override(lid):
         "INSERT INTO leak_pair_overrides(survey_id,on_label,off_label,note) VALUES(?,?,?,?)",
         (lid, on_label, off_label, note))
     conn.commit()
+    new_rev = bump_leak_revision(conn, lid)
     recompute_leak(conn, lid)
     log_leak_event(conn, lid, "override",
                    {"on_label": on_label, "off_label": off_label, "note": note},
-                   revision=surv["revision"])
+                   revision=new_rev)
     state = leak_state(conn, lid)
     conn.close()
     return jsonify(state)
@@ -1637,6 +1647,9 @@ def delete_leak_override(lid, oid):
     if surv["status"] == "confirmed":
         conn.close()
         return json_error("校审已确认,配对表已锁定;如需改配请先重审", 409)
+    if not note:
+        conn.close()
+        return json_error("撤销人工改配必须备注理由,并形成新修订", 422)
     ov = row(conn, "SELECT * FROM leak_pair_overrides WHERE id=? AND survey_id=?",
              (oid, lid))
     if not ov:
@@ -1644,11 +1657,12 @@ def delete_leak_override(lid, oid):
         return json_error("改配记录不存在", 404)
     conn.execute("DELETE FROM leak_pair_overrides WHERE id=?", (oid,))
     conn.commit()
+    new_rev = bump_leak_revision(conn, lid)
     recompute_leak(conn, lid)
     log_leak_event(conn, lid, "override-delete",
                    {"on_label": ov["on_label"], "off_label": ov["off_label"],
-                    "note": note or "撤销改配"},
-                   revision=surv["revision"])
+                    "note": note},
+                   revision=new_rev)
     state = leak_state(conn, lid)
     conn.close()
     return jsonify(state)

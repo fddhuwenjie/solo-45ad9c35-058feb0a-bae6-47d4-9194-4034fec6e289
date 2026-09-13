@@ -508,11 +508,14 @@ function renderOverrides() {
       "<span class='dim'> " + esc(o.note) + "</span>" +
       (locked() ? "" : "<span class='del' title='撤销改配'>✕</span>");
     li.querySelector(".del")?.addEventListener("click", async () => {
+      let note = $("#editNote").value.trim();
+      if (!note) note = prompt("撤销该改配的备注理由(将形成新修订):");
+      if (!note) { status("已取消:撤销改配必须备注"); return; }
       L = await api("/api/leak-surveys/" + L.id + "/overrides/" + o.id, {
         method: "DELETE", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note: $("#editNote").value.trim() || "撤销改配" }),
+        body: JSON.stringify({ note }),
       });
-      status("改配已撤销,已重算"); renderAll();
+      status("改配已撤销,已切换至修订 " + L.revision); renderAll();
     });
     ul.appendChild(li);
   }
@@ -741,7 +744,7 @@ window.addEventListener("mouseup", async () => {
         body: JSON.stringify({ point_label: d.label, condition: d.condition,
           x: d.x, y: d.y, note }),
       });
-      status("测点 " + d.label + " 已移动,沿线结果已重算(新修订事件)");
+      status("测点 " + d.label + " 已移动,已切换至修订 " + L.revision);
     } else if (d.kind === "vertex") {
       const note = requireNote();
       if (!note) { renderViewport(); return; }
@@ -764,7 +767,9 @@ async function doPathAction(pid, body) {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  status(body.action === "split" ? "边界已拆分为两段(新修订)" : "边界顶点已更新(新修订)");
+  status(body.action === "split"
+    ? "边界已拆分为两段,已切换至修订 " + L.revision
+    : "边界顶点已更新,已切换至修订 " + L.revision);
   renderAll();
   return L;
 }
@@ -854,7 +859,7 @@ $("#btnOverride").onclick = async () => {
       off_label: $("#ovOff").value.trim(), note }),
   });
   $("#ovOn").value = $("#ovOff").value = "";
-  status("人工改配已记录,沿线结果已重算");
+  status("人工改配已记录,已切换至修订 " + L.revision);
   renderAll();
 };
 

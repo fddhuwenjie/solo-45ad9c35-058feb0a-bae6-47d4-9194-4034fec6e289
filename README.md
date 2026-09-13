@@ -73,3 +73,34 @@ POST /api/versions/<id>/decide        lock/unlock/exclude/include
 GET  /api/versions/<id>/path          最短补测路径
 GET  /api/versions/<id>/export/coverage.svg | remeasure.csv | recalc.json
 ```
+
+## 边界外逸工作区(`/leakage`)
+
+相邻排练厅感应环同时启用时,本环磁场越过保密边界串入相邻接收器的专项校审:
+先用**关闭工况**沿线估计背景,再与**开启工况**测点配对、按路径里程插值外逸量
+(开启 − 关闭背景,dB),给出连续超限长度、峰值位置和相邻环余量。
+
+测次 CSV 列:`point_id,x,y,field_db[,background_db][,calib_version][,device_id][,time]`。
+
+**相关边界段保持无结论**的五种情形:两测次时间相隔超过时间窗(时段不重叠)、
+测点配对多解、保密边界路径自交、沿线采样间距超过限值、配对校准依据不兼容。
+沿线取点同时按**垂距**与**沿路径里程差**卡影响半径——U 形边界另一支路
+空间近邻(如 6 m)但沿线远隔(如 38 m)的测点不会混入本支路 2 m 测站。
+
+人工改配、调整边界顶点/拆分、拖动误定位测点均**必须备注**,且每次成功变更
+生成并切换至**新修订**(事件挂对应修订号);确认后锁定来源测次、配对表、
+限值与边界,三份导出(标色边界 SVG / 复测点 CSV / 复算 JSON)取自同一确认结果,
+重审后修订号 +1。
+
+```
+POST /api/projects/<pid>/leak-surveys              建校审
+POST /api/leak-surveys/<id>/runs                   导入开/关工况测次(CSV)
+POST /api/leak-surveys/<id>/zones | /paths         圈环区 / 画保密边界
+POST /api/leak-surveys/<id>/overrides              人工改配(备注,新修订)
+PUT  /api/leak-paths/<id>/vertices                 调顶点/拆分(备注,新修订)
+POST /api/leak-surveys/<id>/move                   拖动误定位点(备注,新修订)
+POST /api/leak-surveys/<id>/confirm | /reopen      确认锁定 / 重审(修订+1)
+GET  /api/leak-surveys/<id>/export/boundary.svg | remeasure.csv | recalc.json
+```
+
+回归:`python3 regression_leak.py`。
