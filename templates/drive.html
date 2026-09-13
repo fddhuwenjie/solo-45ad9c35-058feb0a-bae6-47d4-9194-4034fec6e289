@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>驱动基准 — 助听感应环巡测校审</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>驱动基准</h1>
+  <span id="projName" class="proj"></span>
+  <span id="drvBadge" class="badge"></span>
+  <div class="spacer"></div>
+  <label class="hdr">校审</label>
+  <select id="drvSelect"></select>
+  <button id="btnConfirm" title="确认后锁定功放记录、场强记录、锚点、保留段与参数">确认结果</button>
+  <button id="btnReopen" class="hidden" title="解除锁定,调整后重新确认(修订号 +1)">重审</button>
+  <button id="btnExpSvg" title="导出归一化覆盖 SVG(取自确认结果)">覆盖 SVG</button>
+  <button id="btnExpCsv" title="导出逐点换算 CSV(取自确认结果,可追到电流样本)">换算 CSV</button>
+  <button id="btnExpJson" title="导出复算 JSON(取自确认结果,含电流样本)">复算 JSON</button>
+  <a href="/compare" class="hdr-link">复测对照</a>
+  <a href="/leakage" class="hdr-link">边界外逸</a>
+  <a href="/" class="hdr-link">← 返回校审</a>
+</header>
+
+<div id="noProject" class="hidden">
+  <div class="setup-card">
+    <h2>驱动基准校审</h2>
+    <p>巡测几十分钟里功放可能限幅、过热或改输入电平,弱场区也许只是环路电流下降。
+    请先在<a href="/">校审页</a>创建项目(上传场地 SVG),再在此新建驱动基准校审。</p>
+  </div>
+</div>
+
+<main id="main" class="hidden">
+  <aside id="left">
+    <section class="panel panel">
+      <h3>新建校审</h3>
+      <label class="fld">名称 <input id="drvLabel" placeholder="如:晚场巡测 · 主功放"></label>
+      <button id="btnCreate">新建驱动基准校审</button>
+    </section>
+
+    <section class="panel">
+      <h3>功放记录(电流 + 告警)</h3>
+      <input id="recFile" type="file" accept=".csv,text/csv">
+      <div class="btnrow">
+        <input id="recLabel" placeholder="记录标签(可空)" class="mini-in">
+        <button id="btnImportRec">导入功放记录</button>
+      </div>
+      <div id="recInfo" class="msg"></div>
+      <p class="hint">CSV 列:time,current_a[,clip][,overheat]。time 支持秒数、
+      HH:MM[:SS] 或 ISO 日期时间;clip/overheat 填 1 表示告警。</p>
+    </section>
+
+    <section class="panel">
+      <h3>场强记录(带时标)</h3>
+      <input id="ptFile" type="file" accept=".csv,text/csv">
+      <button id="btnImportPts">导入场强记录</button>
+      <div id="ptInfo" class="msg"></div>
+      <p class="hint">CSV 列:point_id,x,y,freq_hz,field_db,noise_db,time[,device_id][,calib_version]。
+      每行一个测点一个频点,各带测量时刻。</p>
+    </section>
+
+    <section class="panel">
+      <h3>时钟锚点(换绑须理由)</h3>
+      <div class="anchor-grid">
+        <input id="ancAmp" placeholder="功放时刻,如 10:00:00">
+        <input id="ancField" placeholder="场强时刻,如 09:58:12">
+      </div>
+      <input id="ancNote" placeholder="绑定/换绑理由(必填)">
+      <button id="btnAnchor">绑定锚点(新修订)</button>
+      <ul id="anchorList" class="list small"></ul>
+      <p class="hint">至少 2 个锚点生成分段时码映射;锚点间线性插值,
+      任一方向不递增即「映射倒退」。</p>
+    </section>
+
+    <section class="panel">
+      <h3>判定参数 <button id="btnSaveParams" class="mini">保存并重算</button></h3>
+      <div class="limits" id="paramsForm">
+        <label>参考电流 A(冻结)<input data-k="ref_current_a" type="number" step="0.1" min="0.01"></label>
+        <label>采样断档上限 s<input data-k="max_sample_gap_s" type="number" step="5" min="1"></label>
+        <label>归一化幅度 ≤ dB<input data-k="max_norm_db" type="number" step="0.5" min="0.5"></label>
+        <label>校准量程下限 A<input data-k="calib_min_a" type="number" step="0.1" min="0.01"></label>
+        <label>校准量程上限 A<input data-k="calib_max_a" type="number" step="0.5"></label>
+      </div>
+      <p class="hint">归一化:校正值 dB = 20·log10(参考电流 / 实测电流)。
+      削波、过热、断档可用下方「保留异常段」豁免(须理由)。</p>
+    </section>
+
+    <section class="panel">
+      <h3>保留异常段(须理由)</h3>
+      <div class="anchor-grid">
+        <select id="keepKind">
+          <option value="clip">削波</option>
+          <option value="overheat">过热</option>
+          <option value="sample-gap">采样断档</option>
+        </select>
+      </div>
+      <div class="anchor-grid">
+        <input id="keepT0" placeholder="起(功放时刻)">
+        <input id="keepT1" placeholder="止(功放时刻)">
+      </div>
+      <input id="keepNote" placeholder="保留理由(必填)">
+      <button id="btnKeep">保留该异常段(新修订)</button>
+      <ul id="keepList" class="list small"></ul>
+    </section>
+
+    <section class="panel">
+      <h3>复测对照(仅已确认版本)</h3>
+      <label class="fld">基准 <select id="cmpBase"></select></label>
+      <label class="fld">复测 <select id="cmpRetest"></select></label>
+      <button id="btnCmpCreate">新建驱动对照</button>
+      <ul id="cmpList" class="list small"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>修订事件</h3>
+      <ul id="eventList" class="list scroll small"></ul>
+    </section>
+  </aside>
+
+  <section id="viewportWrap">
+    <svg id="viewport" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="legend"></div>
+    <div id="tooltip" class="hidden"></div>
+    <div id="statusbar">就绪</div>
+  </section>
+
+  <aside id="right">
+    <section class="panel">
+      <h3>归一化统计</h3>
+      <div id="stats"></div>
+    </section>
+    <section class="panel">
+      <h3>环路电流时间曲线 <span id="chartTitle" class="dim"></span></h3>
+      <svg id="currentChart" viewBox="0 0 380 240"></svg>
+      <p class="hint">绿线=环路电流;红/橙点=削波/过热;蓝虚线=锚点;横虚线=参考电流,
+      绿带=校准量程;圆点=测点(点击进入覆盖计算的为蓝,被排除为紫,保留段豁免为金圈)。
+      与座位图联动核对绑定。</p>
+    </section>
+    <section class="panel">
+      <h3>选中测点</h3>
+      <div id="detail"><p class="dim">在座位图或时间曲线上点击测点</p></div>
+    </section>
+    <section class="panel grow">
+      <h3>测点(原始 → 归一化) <span id="ptCount" class="dim"></span></h3>
+      <ul id="pointList" class="list scroll small"></ul>
+    </section>
+    <section class="panel">
+      <h3>对照结果 <span id="cmpTitle" class="dim"></span></h3>
+      <ul id="cmpDetail" class="list scroll small"></ul>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/drive.js"></script>
+</body>
+</html>

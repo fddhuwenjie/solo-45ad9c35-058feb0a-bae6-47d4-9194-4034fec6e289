@@ -5,13 +5,16 @@
 复测对照:跨轮次配对与差异计算(调用 survey.compare),确认后冻结结果并导出。
 边界外逸:开/关工况配对与沿线插值(调用 survey.leakage),人工改配/调边界形成修订,
 确认后锁定来源测次、配对表与限值,再导出标色边界 SVG / 复测点 CSV / 复算 JSON。
+驱动基准:功放电流记录 + 时钟锚点 -> 分段时码映射 -> 归一化覆盖(调用 survey.drive),
+换绑锚点/保留异常段须备注并形成新修订;确认后锁定记录与参数,
+复测对照只能引用已确认的驱动版本,导出可追到电流样本与换算值。
 """
 import json
 import re
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from survey import compare, csvio, leakage, spatial
+from survey import compare, csvio, drive, leakage, spatial
 from survey.db import get_db, init_db, row, rows
 
 app = Flask(__name__)
@@ -201,6 +204,11 @@ def compare_page():
 @app.route("/leakage")
 def leakage_page():
     return render_template("leakage.html")
+
+
+@app.route("/drive")
+def drive_page():
+    return render_template("drive.html")
 
 
 # ---------------------------------------------------------------- 项目
@@ -1908,6 +1916,727 @@ def export_leak_json(lid):
                     mimetype="application/json", headers={
                         "Content-Disposition": "attachment; filename=boundary_recalc_l%s_r%d.json"
                                                % (lid, state["revision"])})
+
+
+# ---------------------------------------------------------------- 驱动基准
+
+DRIVE_PARAM_FIELDS = ("ref_current_a", "max_sample_gap_s", "max_norm_db",
+                      "calib_min_a", "calib_max_a")
+DRIVE_DEFAULTS = {"ref_current_a": 2.0, "max_sample_gap_s": 60.0,
+                  "max_norm_db": 3.0, "calib_min_a": 0.2, "calib_max_a": 10.0}
+
+
+def get_drive(conn, did):
+    return row(conn, "SELECT * FROM drive_surveys WHERE id=?", (did,))
+
+
+def drive_params(surv):
+    return {k: surv[k] for k in DRIVE_PARAM_FIELDS}
+
+
+def drive_record(conn, did):
+    return row(conn, "SELECT * FROM drive_records WHERE survey_id=? "
+                     "ORDER BY id DESC LIMIT 1", (did,))
+
+
+def drive_samples(conn, record_id):
+    return [{"t": s["t_sec"], "t_text": s["t_text"], "current": s["current_a"],
+             "clip": s["clip"], "overheat": s["overheat"]}
+            for s in rows(conn, "SELECT * FROM drive_samples WHERE record_id=? "
+                                 "ORDER BY t_sec", (record_id,))]
+
+
+def drive_anchors(conn, did):
+    return rows(conn, "SELECT * FROM drive_anchors WHERE survey_id=? "
+                      "ORDER BY field_t, amp_t", (did,))
+
+
+def drive_keeps(conn, did):
+    return rows(conn, "SELECT * FROM drive_keeps WHERE survey_id=? ORDER BY t0", (did,))
+
+
+def log_drive_event(conn, did, kind, payload, revision=None):
+    sr = row(conn, "SELECT revision FROM drive_surveys WHERE id=?", (did,))
+    rev = revision if revision is not None else (sr["revision"] if sr else 1)
+    conn.execute(
+        "INSERT INTO drive_events(survey_id,revision,kind,payload_json) VALUES(?,?,?,?)",
+        (did, rev, kind, json.dumps(payload, ensure_ascii=False)))
+    conn.commit()
+
+
+def bump_drive_revision(conn, did):
+    """换绑锚点/保留异常段成功后生成并切换到新修订,返回新修订号。"""
+    conn.execute("UPDATE drive_surveys SET revision=revision+1 WHERE id=?", (did,))
+    conn.commit()
+    return row(conn, "SELECT revision FROM drive_surveys WHERE id=?", (did,))["revision"]
+
+
+def recompute_drive(conn, did):
+    """按当前功放记录/场强记录/锚点/保留段/参数重算,写 result_json。"""
+    surv = get_drive(conn, did)
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
+    bounds = json.loads(proj["bounds_json"])
+    limits = get_limits(conn, surv["project_id"])
+    zones = get_zones(conn, surv["project_id"])
+    rec = drive_record(conn, did)
+    samples = drive_samples(conn, rec["id"]) if rec else []
+    pts = rows(conn, "SELECT * FROM drive_points WHERE survey_id=?", (did,))
+    result = drive.evaluate(drive_params(surv), samples, pts,
+                            drive_anchors(conn, did), drive_keeps(conn, did),
+                            zones, limits, bounds)
+    conn.execute("UPDATE drive_surveys SET result_json=? WHERE id=?",
+                 (json.dumps(result, ensure_ascii=False), did))
+    conn.commit()
+    return result
+
+
+def drive_state(conn, did):
+    surv = get_drive(conn, did)
+    if not surv:
+        return None
+    proj = row(conn, "SELECT id,name,bounds_json,venue_svg FROM projects WHERE id=?",
+               (surv["project_id"],))
+    rec = drive_record(conn, did)
+    samples = drive_samples(conn, rec["id"]) if rec else []
+    record = None
+    if rec:
+        record = {"id": rec["id"], "label": rec["label"], "device_id": rec["device_id"],
+                  "created_at": rec["created_at"], "n_samples": len(samples),
+                  "t0": samples[0]["t"] if samples else None,
+                  "t1": samples[-1]["t"] if samples else None,
+                  "n_clip": sum(1 for s in samples if s["clip"]),
+                  "n_overheat": sum(1 for s in samples if s["overheat"])}
+    events = rows(conn, "SELECT * FROM drive_events WHERE survey_id=? "
+                        "ORDER BY id DESC LIMIT 60", (did,))
+    for e in events:
+        e["payload"] = json.loads(e.pop("payload_json"))
+    return {
+        "id": surv["id"], "project_id": surv["project_id"],
+        "project_name": proj["name"], "project_bounds": json.loads(proj["bounds_json"]),
+        "venue_svg": proj["venue_svg"],
+        "label": surv["label"], "status": surv["status"], "revision": surv["revision"],
+        "params": drive_params(surv),
+        "record": record, "samples": samples,
+        "n_point_rows": row(conn, "SELECT COUNT(*) AS n FROM drive_points "
+                                  "WHERE survey_id=?", (did,))["n"],
+        "anchors": drive_anchors(conn, did),
+        "keeps": drive_keeps(conn, did),
+        "events": events,
+        "created_at": surv["created_at"], "confirmed_at": surv["confirmed_at"],
+        "source_record_id": surv["source_record_id"],
+        "result": json.loads(surv["result_json"]) if surv["result_json"] else None,
+        "nc_text": drive.NC_TEXT, "keep_kinds": drive.KEEP_KINDS,
+    }
+
+
+@app.route("/api/projects/<int:pid>/drive-surveys", methods=["GET"])
+def list_drive_surveys(pid):
+    conn = get_db()
+    out = []
+    for s in rows(conn, "SELECT * FROM drive_surveys WHERE project_id=? "
+                        "ORDER BY id DESC", (pid,)):
+        result = json.loads(s["result_json"]) if s["result_json"] else None
+        st = result["stats"] if result else None
+        out.append({"id": s["id"], "label": s["label"], "status": s["status"],
+                    "revision": s["revision"], "created_at": s["created_at"],
+                    "confirmed_at": s["confirmed_at"], "stats": st})
+    conn.close()
+    return jsonify(out)
+
+
+@app.route("/api/projects/<int:pid>/drive-surveys", methods=["POST"])
+def create_drive_survey(pid):
+    data = request.get_json(force=True)
+    conn = get_db()
+    if not row(conn, "SELECT id FROM projects WHERE id=?", (pid,)):
+        conn.close()
+        return json_error("项目不存在", 404)
+    cur = conn.execute("INSERT INTO drive_surveys(project_id,label) VALUES(?,?)",
+                       (pid, (data.get("label") or "").strip() or "驱动基准校审"))
+    did = cur.lastrowid
+    conn.commit()
+    log_drive_event(conn, did, "create", {"label": data.get("label", "")})
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/drive-surveys/<int:did>")
+def get_drive_survey(did):
+    conn = get_db()
+    state = drive_state(conn, did)
+    conn.close()
+    if not state:
+        return json_error("驱动基准校审不存在", 404)
+    return jsonify(state)
+
+
+# ---------------- 功放记录 / 场强记录导入
+
+@app.route("/api/drive-surveys/<int:did>/record", methods=["POST"])
+def import_drive_record(did):
+    """导入功放记录(带时标的环路电流与削波/过热告警);同校审重导即替换。"""
+    if "csv" not in request.files or not request.files["csv"].filename:
+        return json_error("缺少 CSV 文件")
+    text = request.files["csv"].read().decode("utf-8-sig", "replace")
+    new_rows, errors = csvio.parse_drive_current_csv(text)
+    if not new_rows:
+        return json_error("CSV 无有效数据行", 400 if not errors else 422)
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,功放记录已锁定;如需替换请先重审", 409)
+    old = drive_record(conn, did)
+    if old:
+        conn.execute("DELETE FROM drive_samples WHERE record_id=?", (old["id"],))
+        conn.execute("DELETE FROM drive_records WHERE id=?", (old["id"],))
+    label = (request.form.get("label") or "").strip() or "功放记录"
+    cur = conn.execute("INSERT INTO drive_records(survey_id,label,device_id) "
+                       "VALUES(?,?,?)",
+                       (did, label, (request.form.get("device_id") or "").strip()))
+    rid = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO drive_samples(record_id,t_text,t_sec,current_a,clip,overheat) "
+        "VALUES(?,?,?,?,?,?)",
+        [(rid, r["t_text"], r["t_sec"], r["current_a"], r["clip"], r["overheat"])
+         for r in new_rows])
+    conn.commit()
+    recompute_drive(conn, did)
+    log_drive_event(conn, did, "import-record", {
+        "label": label, "rows": len(new_rows), "replaced": bool(old),
+        "csv_errors": errors})
+    state = drive_state(conn, did)
+    conn.close()
+    state["import_result"] = {"rows": len(new_rows), "replaced": bool(old),
+                              "csv_errors": errors}
+    return jsonify(state)
+
+
+@app.route("/api/drive-surveys/<int:did>/record", methods=["DELETE"])
+def delete_drive_record(did):
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,功放记录已锁定;如需删除请先重审", 409)
+    rec = drive_record(conn, did)
+    if not rec:
+        conn.close()
+        return json_error("尚未导入功放记录", 404)
+    conn.execute("DELETE FROM drive_samples WHERE record_id=?", (rec["id"],))
+    conn.execute("DELETE FROM drive_records WHERE id=?", (rec["id"],))
+    conn.commit()
+    recompute_drive(conn, did)
+    log_drive_event(conn, did, "delete-record", {"label": rec["label"]})
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/drive-surveys/<int:did>/points", methods=["POST"])
+def import_drive_points(did):
+    """导入带时标的场强记录;同校审重导即整体替换。"""
+    if "csv" not in request.files or not request.files["csv"].filename:
+        return json_error("缺少 CSV 文件")
+    text = request.files["csv"].read().decode("utf-8-sig", "replace")
+    new_rows, errors = csvio.parse_drive_points_csv(text)
+    if not new_rows:
+        return json_error("CSV 无有效数据行", 400 if not errors else 422)
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,场强记录已锁定;如需替换请先重审", 409)
+    old_n = row(conn, "SELECT COUNT(*) AS n FROM drive_points WHERE survey_id=?",
+                (did,))["n"]
+    conn.execute("DELETE FROM drive_points WHERE survey_id=?", (did,))
+    conn.executemany(
+        "INSERT INTO drive_points(survey_id,point_label,x,y,freq_hz,field_db,noise_db,"
+        "t_text,t_sec,device_id,calib_version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        [(did, r["point_label"], r["x"], r["y"], r["freq_hz"], r["field_db"],
+          r["noise_db"], r["t_text"], r["t_sec"], r["device_id"], r["calib_version"])
+         for r in new_rows])
+    conn.commit()
+    recompute_drive(conn, did)
+    log_drive_event(conn, did, "import-points", {
+        "rows": len(new_rows), "replaced": old_n, "csv_errors": errors})
+    state = drive_state(conn, did)
+    conn.close()
+    state["import_result"] = {"rows": len(new_rows), "replaced": old_n,
+                              "csv_errors": errors}
+    return jsonify(state)
+
+
+# ---------------- 时钟锚点(换绑须备注,形成新修订)
+
+@app.route("/api/drive-surveys/<int:did>/anchors", methods=["POST"])
+def add_drive_anchor(did):
+    """绑定/换绑时钟锚点:功放时刻 <-> 场强时刻;必须备注理由,形成新修订。"""
+    data = request.get_json(force=True)
+    note = (data.get("note") or "").strip()
+    if not note:
+        return json_error("绑定/换绑锚点必须备注理由,并形成新修订", 422)
+    amp_t = drive.parse_clock(data.get("amp_t"))
+    field_t = drive.parse_clock(data.get("field_t"))
+    if amp_t is None or field_t is None:
+        return json_error("锚点时刻无法解析(支持秒数、HH:MM[:SS]、ISO 日期时间)")
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,锚点已锁定;如需换绑请先重审", 409)
+    cur = conn.execute(
+        "INSERT INTO drive_anchors(survey_id,amp_t,field_t,amp_text,field_text,note) "
+        "VALUES(?,?,?,?,?,?)",
+        (did, amp_t, field_t, str(data.get("amp_t")), str(data.get("field_t")), note))
+    aid = cur.lastrowid
+    conn.commit()
+    new_rev = bump_drive_revision(conn, did)
+    recompute_drive(conn, did)
+    log_drive_event(conn, did, "anchor", {
+        "anchor_id": aid, "amp_t": amp_t, "field_t": field_t, "note": note},
+        revision=new_rev)
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/drive-anchors/<int:aid>", methods=["DELETE"])
+def delete_drive_anchor(aid):
+    data = request.get_json(force=True) if request.data else {}
+    note = (data.get("note") or "").strip()
+    if not note:
+        return json_error("删除锚点属于换绑,必须备注理由,并形成新修订", 422)
+    conn = get_db()
+    a = row(conn, "SELECT * FROM drive_anchors WHERE id=?", (aid,))
+    if not a:
+        conn.close()
+        return json_error("锚点不存在", 404)
+    surv = get_drive(conn, a["survey_id"])
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,锚点已锁定;如需换绑请先重审", 409)
+    conn.execute("DELETE FROM drive_anchors WHERE id=?", (aid,))
+    conn.commit()
+    new_rev = bump_drive_revision(conn, a["survey_id"])
+    recompute_drive(conn, a["survey_id"])
+    log_drive_event(conn, a["survey_id"], "anchor-delete", {
+        "amp_t": a["amp_t"], "field_t": a["field_t"], "note": note}, revision=new_rev)
+    state = drive_state(conn, a["survey_id"])
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 保留异常段(须备注,形成新修订)
+
+@app.route("/api/drive-surveys/<int:did>/keeps", methods=["POST"])
+def add_drive_keep(did):
+    """保留异常段:豁免功放时钟 [t0,t1] 内的 clip/overheat/sample-gap 排除。"""
+    data = request.get_json(force=True)
+    kind = (data.get("kind") or "").strip()
+    note = (data.get("note") or "").strip()
+    if kind not in drive.KEEP_KINDS:
+        return json_error("kind 必须为 " + "/".join(drive.KEEP_KINDS))
+    if not note:
+        return json_error("保留异常段必须备注理由,并形成新修订", 422)
+    t0, t1 = drive.parse_clock(data.get("t0")), drive.parse_clock(data.get("t1"))
+    if t0 is None or t1 is None or t1 <= t0:
+        return json_error("保留段时刻无法解析或区间为空(t1 必须大于 t0)")
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,保留段已锁定;如需调整请先重审", 409)
+    cur = conn.execute(
+        "INSERT INTO drive_keeps(survey_id,kind,t0,t1,note) VALUES(?,?,?,?,?)",
+        (did, kind, t0, t1, note))
+    kid = cur.lastrowid
+    conn.commit()
+    new_rev = bump_drive_revision(conn, did)
+    recompute_drive(conn, did)
+    log_drive_event(conn, did, "keep", {
+        "keep_id": kid, "kind": kind, "t0": t0, "t1": t1, "note": note},
+        revision=new_rev)
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/drive-keeps/<int:kid>", methods=["DELETE"])
+def delete_drive_keep(kid):
+    data = request.get_json(force=True) if request.data else {}
+    note = (data.get("note") or "").strip()
+    if not note:
+        return json_error("撤销保留段必须备注理由,并形成新修订", 422)
+    conn = get_db()
+    k = row(conn, "SELECT * FROM drive_keeps WHERE id=?", (kid,))
+    if not k:
+        conn.close()
+        return json_error("保留段不存在", 404)
+    surv = get_drive(conn, k["survey_id"])
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,保留段已锁定;如需调整请先重审", 409)
+    conn.execute("DELETE FROM drive_keeps WHERE id=?", (kid,))
+    conn.commit()
+    new_rev = bump_drive_revision(conn, k["survey_id"])
+    recompute_drive(conn, k["survey_id"])
+    log_drive_event(conn, k["survey_id"], "keep-delete", {
+        "kind": k["kind"], "t0": k["t0"], "t1": k["t1"], "note": note},
+        revision=new_rev)
+    state = drive_state(conn, k["survey_id"])
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 判定参数
+
+@app.route("/api/drive-surveys/<int:did>/params", methods=["PUT"])
+def update_drive_params(did):
+    data = request.get_json(force=True)
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,参数已锁定;如需修改请先重审", 409)
+    vals = {}
+    for k in DRIVE_PARAM_FIELDS:
+        if k in data and data[k] not in ("", None):
+            try:
+                vals[k] = float(data[k])
+            except (TypeError, ValueError):
+                conn.close()
+                return json_error("参数 %s 必须为数值" % k)
+    if vals.get("ref_current_a", 1) <= 0 or vals.get("max_sample_gap_s", 1) <= 0 \
+            or vals.get("max_norm_db", 1) <= 0:
+        conn.close()
+        return json_error("参考电流/采样断档/归一化限值必须为正")
+    lo = vals.get("calib_min_a", surv["calib_min_a"])
+    hi = vals.get("calib_max_a", surv["calib_max_a"])
+    if lo <= 0 or hi <= lo:
+        conn.close()
+        return json_error("校准量程必须为正且上限大于下限")
+    if vals:
+        sets = ", ".join(k + "=?" for k in vals)
+        conn.execute("UPDATE drive_surveys SET " + sets + " WHERE id=?",
+                     (*vals.values(), did))
+        conn.commit()
+        recompute_drive(conn, did)
+        log_drive_event(conn, did, "params", {"changed": vals})
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 确认锁定 / 重审
+
+@app.route("/api/drive-surveys/<int:did>/confirm", methods=["POST"])
+def confirm_drive(did):
+    """确认:冻结结果,锁定功放记录/场强记录/锚点/保留段/参数;导出取自此确认结果。"""
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认", 409)
+    rec = drive_record(conn, did)
+    if not rec:
+        conn.close()
+        return json_error("必须先导入功放记录(环路电流与告警)才能确认")
+    if not row(conn, "SELECT 1 FROM drive_points WHERE survey_id=? LIMIT 1", (did,)):
+        conn.close()
+        return json_error("必须先导入带时标的场强记录才能确认")
+    if len(drive_anchors(conn, did)) < 2:
+        conn.close()
+        return json_error("至少需要 2 个时钟锚点才能生成分段时码映射")
+    result = recompute_drive(conn, did)
+    conn.execute("UPDATE drive_surveys SET status='confirmed',"
+                 "confirmed_at=datetime('now'),source_record_id=? WHERE id=?",
+                 (rec["id"], did))
+    conn.commit()
+    log_drive_event(conn, did, "confirm", {
+        "source_record_id": rec["id"], "revision": surv["revision"],
+        "n_ok": result["stats"]["n_ok"], "n_excluded": result["stats"]["n_excluded"]},
+        revision=surv["revision"])
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/drive-surveys/<int:did>/reopen", methods=["POST"])
+def reopen_drive(did):
+    """重审:解除锁定,修订号 +1(此后换绑/保留段形成更新修订)。"""
+    data = request.get_json(force=True) if request.data else {}
+    note = (data.get("note") or "").strip()
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    if surv["status"] != "confirmed":
+        conn.close()
+        return json_error("校审尚未确认", 409)
+    conn.execute("UPDATE drive_surveys SET status='draft',confirmed_at=NULL,"
+                 "revision=revision+1 WHERE id=?", (did,))
+    conn.commit()
+    log_drive_event(conn, did, "reopen", {"note": note or "重审"})
+    state = drive_state(conn, did)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 复测对照(只能引用已确认的驱动版本)
+
+@app.route("/api/projects/<int:pid>/drive-compares", methods=["GET"])
+def list_drive_compares(pid):
+    conn = get_db()
+    survs = {s["id"]: s for s in rows(
+        conn, "SELECT id,label,revision,status FROM drive_surveys WHERE project_id=?",
+        (pid,))}
+    out = []
+    for c in rows(conn, "SELECT * FROM drive_compares WHERE project_id=? "
+                        "ORDER BY id DESC", (pid,)):
+        result = json.loads(c["result_json"]) if c["result_json"] else None
+        out.append({
+            "id": c["id"], "label": c["label"], "created_at": c["created_at"],
+            "base_survey_id": c["base_survey_id"],
+            "retest_survey_id": c["retest_survey_id"],
+            "base_label": (survs.get(c["base_survey_id"]) or {}).get("label", "?"),
+            "retest_label": (survs.get(c["retest_survey_id"]) or {}).get("label", "?"),
+            "stats": result["stats"] if result else None,
+        })
+    conn.close()
+    return jsonify(out)
+
+
+@app.route("/api/projects/<int:pid>/drive-compares", methods=["POST"])
+def create_drive_compare(pid):
+    """新建驱动对照:基准与复测都必须是已确认的驱动版本(引用其冻结结果)。"""
+    data = request.get_json(force=True)
+    try:
+        base_id, retest_id = int(data["base_survey_id"]), int(data["retest_survey_id"])
+    except (KeyError, TypeError, ValueError):
+        return json_error("必须指定基准与复测驱动版本")
+    if base_id == retest_id:
+        return json_error("基准与复测不能是同一驱动版本")
+    conn = get_db()
+    survs = {s["id"]: s for s in rows(
+        conn, "SELECT * FROM drive_surveys WHERE project_id=?", (pid,))}
+    base, retest = survs.get(base_id), survs.get(retest_id)
+    if base is None or retest is None:
+        conn.close()
+        return json_error("所选驱动版本不属于本项目", 404)
+    if base["status"] != "confirmed" or retest["status"] != "confirmed":
+        conn.close()
+        return json_error("复测对照只能引用已确认的驱动版本;请先确认两份校审", 409)
+    result = drive.compare_results(json.loads(base["result_json"]),
+                                   json.loads(retest["result_json"]))
+    cur = conn.execute(
+        "INSERT INTO drive_compares(project_id,base_survey_id,retest_survey_id,label,"
+        "result_json) VALUES(?,?,?,?,?)",
+        (pid, base_id, retest_id,
+         (data.get("label") or "").strip() or "驱动对照 #%s→#%s" % (base_id, retest_id),
+         json.dumps(result, ensure_ascii=False)))
+    cid = cur.lastrowid
+    conn.commit()
+    for sid in (base_id, retest_id):
+        log_drive_event(conn, sid, "compare-ref",
+                        {"compare_id": cid, "base_survey_id": base_id,
+                         "retest_survey_id": retest_id})
+    state = drive_compare_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+def drive_compare_state(conn, cid):
+    c = row(conn, "SELECT * FROM drive_compares WHERE id=?", (cid,))
+    if not c:
+        return None
+    survs = {s["id"]: s for s in rows(
+        conn, "SELECT id,label,revision,status,confirmed_at FROM drive_surveys "
+              "WHERE project_id=?", (c["project_id"],))}
+    return {
+        "id": c["id"], "project_id": c["project_id"], "label": c["label"],
+        "created_at": c["created_at"],
+        "base_survey_id": c["base_survey_id"],
+        "retest_survey_id": c["retest_survey_id"],
+        "base_survey": survs.get(c["base_survey_id"]),
+        "retest_survey": survs.get(c["retest_survey_id"]),
+        "result": json.loads(c["result_json"]) if c["result_json"] else None,
+    }
+
+
+@app.route("/api/drive-compares/<int:cid>")
+def get_drive_compare(cid):
+    conn = get_db()
+    state = drive_compare_state(conn, cid)
+    conn.close()
+    if not state:
+        return json_error("驱动对照不存在", 404)
+    return jsonify(state)
+
+
+# ---------------- 导出(均取自确认结果,可追到电流样本与换算值)
+
+DRIVE_CELL_COLOR = {"ok": "#2e9e5b", "warn": "#d8a012", "fail": "#d24040",
+                    "nodata": "#8a8f98", "noconclusion": "#9b59b6",
+                    "notest": "#3a3f47"}
+
+
+def confirmed_drive(conn, did):
+    """读取已确认校审的冻结结果;未确认返回 (None, None)。"""
+    surv = get_drive(conn, did)
+    if not surv or surv["status"] != "confirmed" or not surv["result_json"]:
+        return None, None
+    return surv, json.loads(surv["result_json"])
+
+
+@app.route("/api/drive-surveys/<int:did>/export/drive.svg")
+def export_drive_svg(did):
+    conn = get_db()
+    surv, result = confirmed_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = drive_state(conn, did)
+    conn.close()
+    bounds = state["project_bounds"]
+    params = state["params"]
+
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.2f %.2f %.2f %.2f" '
+             'font-family="sans-serif">' % (bounds["min_x"] - 4, bounds["min_y"] - 6,
+                                            bounds["width"] + 8, bounds["height"] + 12)]
+    parts.append("<g opacity='0.35'>%s</g>" % svg_inner(state["venue_svg"]))
+    cs = result["grid"]["cs"]
+    for c in result["cells"]:
+        parts.append(
+            "<rect x='%.2f' y='%.2f' width='%.2f' height='%.2f' fill='%s' "
+            "fill-opacity='0.55'><title>%s %s</title></rect>"
+            % (c["x"] - cs / 2, c["y"] - cs / 2, cs, cs,
+               DRIVE_CELL_COLOR.get(c["status"], "#888"), c["status"], c["reason"]))
+    for p in result["points"]:
+        color = "#1c6dd9" if p["status"] == "ok" else "#9b59b6"
+        parts.append("<circle cx='%.2f' cy='%.2f' r='0.55' fill='%s' stroke='#fff' "
+                     "stroke-width='0.15'><title>%s %s 原始 %.1f→归一 %s dB</title></circle>"
+                     % (p["x"], p["y"], color, p["label"],
+                        "合格" if p["status"] == "ok" else
+                        "/".join(drive.reason_text(r) for r in p["reasons"]),
+                        p["raw_ref_db"],
+                        "%.1f" % p["norm_ref_db"] if p["norm_ref_db"] is not None else "—"))
+        if p["kept"]:
+            parts.append("<circle cx='%.2f' cy='%.2f' r='0.95' fill='none' "
+                         "stroke='#ffd75e' stroke-width='0.25'/>" % (p["x"], p["y"]))
+    legend = [("#1c6dd9", "归一化合格测点"), ("#9b59b6", "被排除测点"),
+              ("#ffd75e", "保留异常段"), ("#2e9e5b", "覆盖合格"),
+              ("#d24040", "覆盖不合格"), ("#8a8f98", "证据不足")]
+    lx, ly = bounds["min_x"], bounds["min_y"] + bounds["height"] + 2
+    for i, (color, txt) in enumerate(legend):
+        parts.append("<rect x='%.2f' y='%.2f' width='2' height='2' fill='%s'/>"
+                     "<text x='%.2f' y='%.2f' font-size='2.2' fill='#222'>%s</text>"
+                     % (lx + i * 16, ly, color, lx + i * 16 + 2.6, ly + 1.8, txt))
+    stt = result["stats"]
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.4' fill='#222'>%s · %s · 修订 %d · "
+                 "测点 %d(排除 %d)· 参考电流 %.2f A</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 3.2, state["project_name"],
+                    state["label"], state["revision"], stt["n_points"],
+                    stt["n_excluded"], params["ref_current_a"]))
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.0' fill='#222'>场强已按 20·log10("
+                 "I参考/I实际) 归一化 · 确认于 %s</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 0.8, state["confirmed_at"] or ""))
+    parts.append("</svg>")
+    return Response("".join(parts), mimetype="image/svg+xml", headers={
+        "Content-Disposition": "attachment; filename=drive_d%s_r%d.svg"
+                               % (did, state["revision"])})
+
+
+@app.route("/api/drive-surveys/<int:did>/export/points.csv")
+def export_drive_csv(did):
+    conn = get_db()
+    surv, result = confirmed_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    conn.close()
+    head = ["point_id", "freq_hz", "field_time", "field_t_s", "amp_t_s",
+            "current_a", "ref_current_a", "correction_db",
+            "sample_lo_t_s", "sample_lo_a", "sample_hi_t_s", "sample_hi_a",
+            "raw_field_db", "norm_field_db", "status", "reasons", "kept"]
+    lines = [",".join(head)]
+    ref_i = result["params"]["ref_current_a"]
+
+    def q(s):
+        return '"%s"' % str(s).replace('"', '""') if s else ""
+
+    def num(v, nd=3):
+        return "" if v is None else ("%.*f" % (nd, v))
+
+    for r in result["rows"]:
+        lo, hi = r["sample_lo"] or {}, r["sample_hi"] or {}
+        lines.append(",".join([
+            r["label"], "%g" % r["freq_hz"], q(r["t_text"]), num(r["field_t"], 1),
+            num(r["amp_t"], 1), num(r["current_a"]), "%.3f" % ref_i,
+            num(r["correction_db"], 2),
+            num(lo.get("t"), 1), num(lo.get("current")),
+            num(hi.get("t"), 1), num(hi.get("current")),
+            num(r["raw_db"], 2), num(r["norm_db"], 2),
+            "excluded" if r["reasons"] else "ok",
+            q(";".join(drive.reason_text(c) for c in r["reasons"])),
+            q(";".join(drive.reason_text(c) for c in r["kept"]))]))
+    lines.append("# ref_current_a,%.3f" % ref_i)
+    lines.append("# 归一化: norm_field_db = raw_field_db + 20*log10(ref_current_a/current_a)")
+    return Response("﻿" + "\n".join(lines), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=drive_points_d%s_r%d.csv"
+                               % (did, surv["revision"])})
+
+
+@app.route("/api/drive-surveys/<int:did>/export/recalc.json")
+def export_drive_json(did):
+    conn = get_db()
+    surv, result = confirmed_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = drive_state(conn, did)
+    conn.close()
+    payload = {
+        "survey": {k: state[k] for k in
+                   ("id", "project_id", "project_name", "label", "status", "revision",
+                    "created_at", "confirmed_at", "source_record_id")},
+        "record": state["record"],
+        "params": state["params"],
+        "anchors": state["anchors"],
+        "keeps": state["keeps"],
+        "samples": state["samples"],
+        "events": state["events"],
+        "result": result,
+        "nc_text": drive.NC_TEXT,
+        "normalization": "norm_field_db = raw_field_db + 20*log10(ref_current_a/current_a)",
+    }
+    return Response(json.dumps(payload, ensure_ascii=False, indent=1),
+                    mimetype="application/json", headers={
+                        "Content-Disposition": "attachment; filename=drive_recalc_d%s_r%d.json"
+                                               % (did, state["revision"])})
 
 
 if __name__ == "__main__":

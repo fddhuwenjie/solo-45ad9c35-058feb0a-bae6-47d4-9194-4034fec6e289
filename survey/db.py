@@ -1,5 +1,6 @@
 """SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定、
-复测对照,以及边界外逸工作区(测次/测点/环区/保密边界/改配/修订事件)。"""
+复测对照,边界外逸工作区(测次/测点/环区/保密边界/改配/修订事件),
+以及驱动基准工作区(功放记录/电流样本/场强记录/时钟锚点/保留段/修订事件/对照)。"""
 import os
 import sqlite3
 
@@ -179,6 +180,91 @@ CREATE TABLE IF NOT EXISTS leak_events(
   revision INTEGER DEFAULT 1,
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ---------------- 驱动基准工作区 ----------------
+-- 一次驱动基准校审:功放记录(电流+告警) + 带时标场强记录 + 时钟锚点 -> 归一化覆盖
+CREATE TABLE IF NOT EXISTS drive_surveys(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  label TEXT DEFAULT '',
+  ref_current_a REAL DEFAULT 2.0,     -- 冻结的参考电流 A(归一化基准)
+  max_sample_gap_s REAL DEFAULT 60.0, -- 电流采样最大断档 s
+  max_norm_db REAL DEFAULT 3.0,       -- 归一化幅度限值 dB(|校正值|超过即越限)
+  calib_min_a REAL DEFAULT 0.2,       -- 电流校准量程下限 A
+  calib_max_a REAL DEFAULT 10.0,      -- 电流校准量程上限 A
+  status TEXT DEFAULT 'draft',        -- draft | confirmed
+  result_json TEXT,
+  revision INTEGER DEFAULT 1,         -- 换绑锚点/保留异常段使修订号 +1
+  source_record_id INTEGER,           -- 确认时锁定的功放记录
+  created_at TEXT DEFAULT (datetime('now')),
+  confirmed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS drive_records(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  label TEXT DEFAULT '',
+  device_id TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS drive_samples(
+  id INTEGER PRIMARY KEY,
+  record_id INTEGER NOT NULL REFERENCES drive_records(id),
+  t_text TEXT DEFAULT '',
+  t_sec REAL NOT NULL,
+  current_a REAL NOT NULL,
+  clip INTEGER DEFAULT 0,
+  overheat INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_dsamp_record ON drive_samples(record_id, t_sec);
+CREATE TABLE IF NOT EXISTS drive_points(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  point_label TEXT NOT NULL,
+  x REAL NOT NULL, y REAL NOT NULL,
+  freq_hz REAL NOT NULL,
+  field_db REAL NOT NULL,
+  noise_db REAL NOT NULL,
+  t_text TEXT DEFAULT '',
+  t_sec REAL NOT NULL,
+  device_id TEXT DEFAULT '',
+  calib_version TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_dpts_survey ON drive_points(survey_id, point_label);
+CREATE TABLE IF NOT EXISTS drive_anchors(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  amp_t REAL NOT NULL,                -- 功放时钟(秒)
+  field_t REAL NOT NULL,              -- 场强记录时钟(秒)
+  amp_text TEXT DEFAULT '',
+  field_text TEXT DEFAULT '',
+  note TEXT DEFAULT '',               -- 绑定/换绑理由
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS drive_keeps(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  kind TEXT NOT NULL,                 -- clip | overheat | sample-gap
+  t0 REAL NOT NULL, t1 REAL NOT NULL, -- 功放时钟区段(秒)
+  note TEXT NOT NULL,                 -- 保留理由(必填)
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS drive_events(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  revision INTEGER DEFAULT 1,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS drive_compares(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  base_survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  retest_survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  label TEXT DEFAULT '',
+  result_json TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 """

@@ -174,3 +174,13 @@ button:disabled:hover { border-color: var(--line); }
 #profile .retest-line { stroke: #f0932b; stroke-width: 1.6; fill: none; stroke-dasharray: 6 3; }
 #profile .limit-line { stroke: #d24040; stroke-width: 1; stroke-dasharray: 5 4; }
 #profile text.delta { fill: #ffd75e; font-size: 9px; }
+
+/* ---------------- 驱动基准工作区 ---------------- */
+.anchor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 4px; }
+#currentChart { width: 100%; background: #10141a; border: 1px solid var(--line); border-radius: 4px; }
+#currentChart text { fill: var(--dim); font-size: 9px; }
+#currentChart .axis { stroke: #3a4350; stroke-width: 1; }
+#currentChart .grid { stroke: #232a35; stroke-width: 1; }
+#currentChart .field-line { stroke: #4dd07a; stroke-width: 1.8; fill: none; }
+#currentChart .limit-line { stroke: #d24040; stroke-width: 1; stroke-dasharray: 5 4; }
+#currentChart text.anchor-tag { fill: #4da3ff; font-size: 8px; }
