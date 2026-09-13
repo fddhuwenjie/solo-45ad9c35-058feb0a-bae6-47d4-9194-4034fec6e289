@@ -1,4 +1,5 @@
-"""SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定、复测对照。"""
+"""SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定、
+复测对照,以及边界外逸工作区(测次/测点/环区/保密边界/改配/修订事件)。"""
 import os
 import sqlite3
 
@@ -101,6 +102,81 @@ CREATE TABLE IF NOT EXISTS pair_overrides(
 CREATE TABLE IF NOT EXISTS comparison_events(
   id INTEGER PRIMARY KEY,
   comparison_id INTEGER NOT NULL REFERENCES comparisons(id),
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ---------------- 边界外逸工作区 ----------------
+-- 一次边界外逸校审:选定本环 + 相邻环,导入开/关两种工况测次
+CREATE TABLE IF NOT EXISTS leak_surveys(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  label TEXT DEFAULT '',
+  own_loop TEXT DEFAULT '',          -- 本环名称
+  adjacent_loop TEXT DEFAULT '',     -- 相邻环名称
+  leak_limit_db REAL DEFAULT 6.0,    -- 外逸量限值 dB(开-关背景)
+  max_field_db REAL DEFAULT -32.0,   -- 边界外绝对场强限值 dB
+  min_points INTEGER DEFAULT 2,      -- 插值所需最少有效配对测点
+  influence_radius REAL DEFAULT 8.0, -- 测站影响半径 m
+  max_sample_gap REAL DEFAULT 4.0,   -- 沿线允许最大采样间距 m
+  max_time_gap_h REAL DEFAULT 2.0,   -- 开/关测次时间窗(小时),超过则时段不重叠
+  status TEXT DEFAULT 'draft',       -- draft | confirmed
+  result_json TEXT,
+  revision INTEGER DEFAULT 1,        -- 人工改配/调边界使修订号 +1
+  source_on_run_id INTEGER,          -- 确认时锁定的来源测次
+  source_off_run_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  confirmed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS leak_runs(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES leak_surveys(id),
+  condition TEXT NOT NULL,           -- on(环路开启) | off(关闭,估背景)
+  label TEXT DEFAULT '',
+  time_text TEXT DEFAULT '',         -- 测量时间(文本,解析失败不阻断但不做时段校验)
+  time_iso TEXT,                     -- 解析后的 ISO 时间(可空)
+  device_id TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS leak_points(
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES leak_runs(id),
+  point_label TEXT NOT NULL,
+  x REAL NOT NULL, y REAL NOT NULL,
+  field_db REAL NOT NULL,
+  background_db REAL,                -- 现场记录的背景读数(可空),仅参考
+  calib_version TEXT DEFAULT '',
+  device_id TEXT DEFAULT '',
+  moved INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_leakpts_run ON leak_points(run_id, point_label);
+CREATE TABLE IF NOT EXISTS leak_zones(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES leak_surveys(id),
+  kind TEXT NOT NULL,                -- own(本环服务区) | adjacent(相邻环区)
+  name TEXT DEFAULT '',
+  polygon_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS leak_paths(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES leak_surveys(id),
+  name TEXT DEFAULT '',
+  vertices_json TEXT NOT NULL,       -- [[x,y],...] 折线(保密边界)
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS leak_pair_overrides(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES leak_surveys(id),
+  on_label TEXT NOT NULL,
+  off_label TEXT,                    -- NULL = 取消配对
+  note TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS leak_events(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES leak_surveys(id),
+  revision INTEGER DEFAULT 1,
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at TEXT DEFAULT (datetime('now'))

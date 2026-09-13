@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>边界外逸 — 助听感应环巡测校审</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>边界外逸</h1>
+  <span id="projName" class="proj"></span>
+  <span id="lkBadge" class="badge"></span>
+  <div class="spacer"></div>
+  <label class="hdr">校审</label>
+  <select id="lkSelect"></select>
+  <button id="btnConfirm" title="确认后锁定来源测次、配对表与限值">确认结果</button>
+  <button id="btnReopen" class="hidden" title="解除锁定,调整后重新确认(形成新修订)">重审</button>
+  <button id="btnExpSvg" title="导出标色边界 SVG(取自确认结果)">标色边界 SVG</button>
+  <button id="btnExpCsv" title="导出复测点 CSV(取自确认结果)">复测点 CSV</button>
+  <button id="btnExpJson" title="导出复算 JSON(取自确认结果)">复算 JSON</button>
+  <a href="/" class="hdr-link">← 返回校审</a>
+</header>
+
+<div id="noProject" class="hidden">
+  <div class="setup-card">
+    <h2>边界外逸校审</h2>
+    <p>请先在<a href="/">校审页</a>创建项目(上传场地 SVG),再在此新建边界外逸校审。</p>
+  </div>
+</div>
+
+<main id="main" class="hidden">
+  <aside id="left">
+    <section class="panel">
+      <h3>新建校审</h3>
+      <label class="fld">名称 <input id="lkLabel" placeholder="如:东排练厅 A/B 环隔墙"></label>
+      <label class="fld">本环 <input id="ownLoop" placeholder="A环(本环服务区)"></label>
+      <label class="fld">相邻环 <input id="adjLoop" placeholder="B环"></label>
+      <button id="btnCreate">新建边界外逸校审</button>
+    </section>
+
+    <section class="panel">
+      <h3>测次导入(开/关工况错时测量)</h3>
+      <div class="btnrow">
+        <button id="btnImportOn" class="cond-on">导入开启 on</button>
+        <button id="btnImportOff" class="cond-off">导入关闭 off</button>
+      </div>
+      <input id="runFile" type="file" accept=".csv,text/csv" class="hidden">
+      <input id="runLabel" placeholder="测次标签(可空)" class="mini-in">
+      <input id="runTime" placeholder="测量时间,如 2026-09-12 10:00(可空,取 CSV time 列)">
+      <ul id="runList" class="list small"></ul>
+      <p class="hint">CSV 列:point_id,x,y,field_db[,background_db][,calib_version][,device_id][,time]。
+      先用关闭工况估计背景,再与开启工况配对插值。</p>
+      <div id="importMsg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h3>工具</h3>
+      <div class="tools">
+        <button data-tool="select" class="tool active">选择/拖动</button>
+        <button data-tool="pan" class="tool">平移</button>
+        <button data-tool="own" class="tool">圈本环服务区</button>
+        <button data-tool="adjacent" class="tool">圈相邻环区</button>
+        <button data-tool="boundary" class="tool">画保密边界</button>
+      </div>
+      <div id="drawBar" class="hidden">
+        <input id="drawName" placeholder="名称(分区/边界)">
+        <button id="btnDrawDone">完成</button>
+        <button id="btnDrawCancel">取消</button>
+      </div>
+      <p class="hint">边界:单击加点、双击或“完成”结束;选择工具下可拖动误定位测点、
+      拖动边界顶点;边界工具下单击顶点附近可拆分该段。</p>
+      <input id="editNote" placeholder="改配/调边界/移点的备注理由(必填)">
+    </section>
+
+    <section class="panel">
+      <h3>判定参数 <button id="btnSaveParams" class="mini">保存并重算</button></h3>
+      <div class="limits" id="paramsForm">
+        <label>外逸量限值 dB<input data-k="leak_limit_db" type="number" step="0.5"></label>
+        <label>边界外绝对场强 ≤ dB<input data-k="max_field_db" type="number" step="0.5"></label>
+        <label>最少配对测点数<input data-k="min_points" type="number" step="1" min="1"></label>
+        <label>影响半径 m<input data-k="influence_radius" type="number" step="0.5" min="0.5"></label>
+        <label>最大采样间距 m<input data-k="max_sample_gap" type="number" step="0.5" min="0.5"></label>
+        <label>测次时间窗 h<input data-k="max_time_gap_h" type="number" step="0.25" min="0.25"></label>
+      </div>
+      <p class="hint">外逸量 = 开启场强 − 关闭背景(dB)。两测次时间相隔超过时间窗 →
+      时段不重叠,边界段无结论。</p>
+    </section>
+
+    <section class="panel">
+      <h3>人工改配</h3>
+      <input id="ovOn" placeholder="开启测点号">
+      <input id="ovOff" placeholder="关闭测点号(留空 = 取消配对)">
+      <button id="btnOverride">提交改配(需上方备注)</button>
+      <ul id="overrideList" class="list small"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>边界与环区</h3>
+      <ul id="pathList" class="list scroll small"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>修订事件</h3>
+      <ul id="eventList" class="list scroll small"></ul>
+    </section>
+  </aside>
+
+  <section id="viewportWrap">
+    <svg id="viewport" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="viewMode">
+      <button data-mode="both" class="active">开+关</button>
+      <button data-mode="on">仅开启</button>
+      <button data-mode="off">仅关闭</button>
+    </div>
+    <div id="legend"></div>
+    <div id="tooltip" class="hidden"></div>
+    <div id="statusbar">就绪</div>
+  </section>
+
+  <aside id="right">
+    <section class="panel">
+      <h3>外逸统计</h3>
+      <div id="stats"></div>
+    </section>
+    <section class="panel">
+      <h3>连续超限段 / 峰值</h3>
+      <ul id="runList2" class="list small"></ul>
+    </section>
+    <section class="panel">
+      <h3>沿线里程曲线 <span id="profileTitle" class="dim"></span></h3>
+      <svg id="profile" viewBox="0 0 360 220"></svg>
+      <p class="hint">实线=外逸量,虚线=开启场强;红横线为限值;紫段无结论、灰段无数据。
+      曲线上移动/点击与平面图测站联动。</p>
+    </section>
+    <section class="panel grow">
+      <h3>配对测点 <span id="pairCount" class="dim"></span></h3>
+      <ul id="pairList" class="list scroll small"></ul>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/leakage.js"></script>
+</body>
+</html>

@@ -3,13 +3,15 @@
 职责:解析测量 CSV、空间计算(调用 survey.spatial)、SQLite 版本存取、
 限值校核、增量重算、补测路径规划与三类导出(覆盖 SVG / 补测清单 / 复算 JSON)。
 复测对照:跨轮次配对与差异计算(调用 survey.compare),确认后冻结结果并导出。
+边界外逸:开/关工况配对与沿线插值(调用 survey.leakage),人工改配/调边界形成修订,
+确认后锁定来源测次、配对表与限值,再导出标色边界 SVG / 复测点 CSV / 复算 JSON。
 """
 import json
 import re
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from survey import compare, csvio, spatial
+from survey import compare, csvio, leakage, spatial
 from survey.db import get_db, init_db, row, rows
 
 app = Flask(__name__)
@@ -194,6 +196,11 @@ def index():
 @app.route("/compare")
 def compare_page():
     return render_template("compare.html")
+
+
+@app.route("/leakage")
+def leakage_page():
+    return render_template("leakage.html")
 
 
 # ---------------------------------------------------------------- 项目
@@ -1085,6 +1092,808 @@ def export_compare_json(cid):
     return Response(json.dumps(payload, ensure_ascii=False, indent=1),
                     mimetype="application/json", headers={
                         "Content-Disposition": "attachment; filename=compare_recalc_c%s.json" % cid})
+
+
+# ---------------------------------------------------------------- 边界外逸
+
+LEAK_PARAM_FIELDS = ("leak_limit_db", "max_field_db", "min_points",
+                     "influence_radius", "max_sample_gap", "max_time_gap_h")
+LEAK_DEFAULTS = {"leak_limit_db": 6.0, "max_field_db": -32.0, "min_points": 2,
+                 "influence_radius": 8.0, "max_sample_gap": 4.0,
+                 "max_time_gap_h": 2.0}
+
+LEAK_ZONE_COLOR = {"own": "#4da3ff", "adjacent": "#f0932b"}
+
+
+def leak_params(comp_row):
+    return {k: comp_row[k] for k in LEAK_PARAM_FIELDS}
+
+
+def get_leak(conn, lid):
+    return row(conn, "SELECT * FROM leak_surveys WHERE id=?", (lid,))
+
+
+def leak_runs(conn, lid):
+    return {r["condition"]: r for r in rows(
+        conn, "SELECT * FROM leak_runs WHERE survey_id=?", (lid,))}
+
+
+def leak_paths(conn, lid):
+    out = []
+    for p in rows(conn, "SELECT * FROM leak_paths WHERE survey_id=? ORDER BY id", (lid,)):
+        out.append({"id": p["id"], "name": p["name"],
+                    "vertices": json.loads(p["vertices_json"])})
+    return out
+
+
+def leak_zones(conn, lid):
+    out = []
+    for z in rows(conn, "SELECT * FROM leak_zones WHERE survey_id=? ORDER BY id", (lid,)):
+        out.append({"id": z["id"], "kind": z["kind"], "name": z["name"],
+                    "polygon": json.loads(z["polygon_json"])})
+    return out
+
+
+def leak_overrides(conn, lid):
+    return rows(conn, "SELECT * FROM leak_pair_overrides WHERE survey_id=? ORDER BY id", (lid,))
+
+
+def log_leak_event(conn, lid, kind, payload, revision=None):
+    sr = row(conn, "SELECT revision FROM leak_surveys WHERE id=?", (lid,))
+    rev = revision if revision is not None else (sr["revision"] if sr else 1)
+    conn.execute(
+        "INSERT INTO leak_events(survey_id,revision,kind,payload_json) VALUES(?,?,?,?)",
+        (lid, rev, kind, json.dumps(payload, ensure_ascii=False)))
+    conn.commit()
+
+
+def recompute_leak(conn, lid):
+    """按当前测次/配对表(含人工改配)/限值/边界重算,写 result_json。"""
+    surv = get_leak(conn, lid)
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
+    bounds = json.loads(proj["bounds_json"])
+    runs = leak_runs(conn, lid)
+    on_rows = rows(conn, "SELECT * FROM leak_points WHERE run_id=?",
+                   (runs["on"]["id"],)) if "on" in runs else []
+    off_rows = rows(conn, "SELECT * FROM leak_points WHERE run_id=?",
+                    (runs["off"]["id"],)) if "off" in runs else []
+    result = leakage.evaluate_survey(
+        on_rows, off_rows, runs, leak_zones(conn, lid), leak_paths(conn, lid),
+        leak_params(surv), leak_overrides(conn, lid), bounds)
+    conn.execute("UPDATE leak_surveys SET result_json=? WHERE id=?",
+                 (json.dumps(result, ensure_ascii=False), lid))
+    conn.commit()
+    return result
+
+
+def leak_state(conn, lid):
+    surv = get_leak(conn, lid)
+    if not surv:
+        return None
+    proj = row(conn, "SELECT id,name,bounds_json,venue_svg FROM projects WHERE id=?",
+               (surv["project_id"],))
+    bounds = json.loads(proj["bounds_json"])
+    run_rows = rows(conn, "SELECT * FROM leak_runs WHERE survey_id=? ORDER BY id", (lid,))
+    point_counts = {}
+    for r in run_rows:
+        point_counts[r["id"]] = row(
+            conn, "SELECT COUNT(*) AS n FROM leak_points WHERE run_id=?", (r["id"],))["n"]
+    for r in run_rows:
+        r["n_points"] = point_counts[r["id"]]
+    events = rows(conn, "SELECT * FROM leak_events WHERE survey_id=? ORDER BY id DESC LIMIT 60",
+                  (lid,))
+    for e in events:
+        e["payload"] = json.loads(e.pop("payload_json"))
+    return {
+        "id": surv["id"], "project_id": surv["project_id"],
+        "project_name": proj["name"], "project_bounds": bounds,
+        "venue_svg": proj["venue_svg"],
+        "label": surv["label"], "status": surv["status"],
+        "revision": surv["revision"],
+        "own_loop": surv["own_loop"], "adjacent_loop": surv["adjacent_loop"],
+        "params": leak_params(surv),
+        "runs": run_rows,
+        "zones": leak_zones(conn, lid),
+        "paths": leak_paths(conn, lid),
+        "overrides": leak_overrides(conn, lid),
+        "events": events,
+        "created_at": surv["created_at"], "confirmed_at": surv["confirmed_at"],
+        "source_on_run_id": surv["source_on_run_id"],
+        "source_off_run_id": surv["source_off_run_id"],
+        "result": json.loads(surv["result_json"]) if surv["result_json"] else None,
+        "nc_text": leakage.NC_TEXT,
+    }
+
+
+@app.route("/api/projects/<int:pid>/leak-surveys", methods=["GET"])
+def list_leak_surveys(pid):
+    conn = get_db()
+    out = []
+    for s in rows(conn, "SELECT * FROM leak_surveys WHERE project_id=? ORDER BY id DESC", (pid,)):
+        result = json.loads(s["result_json"]) if s["result_json"] else None
+        st = result["stats"] if result else None
+        out.append({"id": s["id"], "label": s["label"], "status": s["status"],
+                    "revision": s["revision"], "own_loop": s["own_loop"],
+                    "adjacent_loop": s["adjacent_loop"],
+                    "created_at": s["created_at"], "confirmed_at": s["confirmed_at"],
+                    "stats": st})
+    conn.close()
+    return jsonify(out)
+
+
+@app.route("/api/projects/<int:pid>/leak-surveys", methods=["POST"])
+def create_leak_survey(pid):
+    data = request.get_json(force=True)
+    conn = get_db()
+    if not row(conn, "SELECT id FROM projects WHERE id=?", (pid,)):
+        conn.close()
+        return json_error("项目不存在", 404)
+    cur = conn.execute(
+        "INSERT INTO leak_surveys(project_id,label,own_loop,adjacent_loop) "
+        "VALUES(?,?,?,?)",
+        (pid, (data.get("label") or "").strip() or "边界外逸校审",
+         (data.get("own_loop") or "").strip() or "本环",
+         (data.get("adjacent_loop") or "").strip() or "相邻环"))
+    lid = cur.lastrowid
+    conn.commit()
+    log_leak_event(conn, lid, "create", {"label": data.get("label", "")})
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>")
+def get_leak_survey(lid):
+    conn = get_db()
+    state = leak_state(conn, lid)
+    conn.close()
+    if not state:
+        return json_error("边界外逸校审不存在", 404)
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/params", methods=["PUT"])
+def update_leak_params(lid):
+    data = request.get_json(force=True)
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,限值已锁定;如需修改请先重审", 409)
+    vals = {}
+    for k in LEAK_PARAM_FIELDS:
+        if k in data and data[k] not in ("", None):
+            try:
+                vals[k] = float(data[k])
+            except (TypeError, ValueError):
+                conn.close()
+                return json_error("参数 %s 必须为数值" % k)
+    if vals.get("min_points", 1) < 1 or vals.get("influence_radius", 1) <= 0 \
+            or vals.get("max_sample_gap", 1) <= 0 or vals.get("max_time_gap_h", 1) <= 0:
+        conn.close()
+        return json_error("插值/半径/间距/时间窗必须为正,最少测点数 >= 1")
+    sets = ", ".join(k + "=?" for k in vals)
+    conn.execute("UPDATE leak_surveys SET " + sets + " WHERE id=?",
+                 (*vals.values(), lid))
+    conn.commit()
+    if vals:
+        recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "params", {"changed": vals})
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 测次导入 / 测点拖动
+
+@app.route("/api/leak-surveys/<int:lid>/runs", methods=["POST"])
+def import_leak_run(lid):
+    condition = request.form.get("condition")
+    if condition not in ("on", "off"):
+        return json_error("condition 必须为 on(开启)或 off(关闭)")
+    if "csv" not in request.files or not request.files["csv"].filename:
+        return json_error("缺少 CSV 文件")
+    text = request.files["csv"].read().decode("utf-8-sig", "replace")
+    new_rows, errors = csvio.parse_leak_csv(text)
+    if not new_rows:
+        return json_error("CSV 无有效数据行", 400 if not errors else 422)
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,来源测次已锁定;如需替换请先重审", 409)
+    old = row(conn, "SELECT id FROM leak_runs WHERE survey_id=? AND condition=?",
+              (lid, condition))
+    if old:  # 同工况重导:替换该测次
+        conn.execute("DELETE FROM leak_points WHERE run_id=?", (old["id"],))
+        conn.execute("DELETE FROM leak_runs WHERE id=?", (old["id"],))
+    label = (request.form.get("label") or "").strip() or \
+        ("环路开启" if condition == "on" else "环路关闭(背景)")
+    time_text = (request.form.get("time_text") or "").strip()
+    if not time_text:
+        time_text = next((r["time"] for r in new_rows if r.get("time")), "")
+    cur = conn.execute(
+        "INSERT INTO leak_runs(survey_id,condition,label,time_text,time_iso,device_id) "
+        "VALUES(?,?,?,?,?,?)",
+        (lid, condition, label, time_text,
+         leakage.parse_time(time_text).isoformat() if leakage.parse_time(time_text) else None,
+         (new_rows[0].get("device_id") or "")))
+    rid = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO leak_points(run_id,point_label,x,y,field_db,background_db,"
+        "calib_version,device_id,moved) VALUES(?,?,?,?,?,?,?,?,0)",
+        [(rid, r["point_label"], r["x"], r["y"], r["field_db"], r["background_db"],
+          r["calib_version"], r.get("device_id") or "") for r in new_rows])
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "import-run", {
+        "condition": condition, "label": label, "time_text": time_text,
+        "rows": len(new_rows), "replaced": bool(old), "csv_errors": errors})
+    state = leak_state(conn, lid)
+    conn.close()
+    state["import_result"] = {"condition": condition, "rows": len(new_rows),
+                              "replaced": bool(old), "csv_errors": errors}
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/runs/<int:rid>", methods=["DELETE"])
+def delete_leak_run(lid, rid):
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,来源测次已锁定;如需删除请先重审", 409)
+    r = row(conn, "SELECT * FROM leak_runs WHERE id=? AND survey_id=?", (rid, lid))
+    if not r:
+        conn.close()
+        return json_error("测次不存在", 404)
+    conn.execute("DELETE FROM leak_points WHERE run_id=?", (rid,))
+    conn.execute("DELETE FROM leak_runs WHERE id=?", (rid,))
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "delete-run", {"condition": r["condition"], "label": r["label"]})
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/move", methods=["POST"])
+def move_leak_point(lid):
+    """拖动误定位点。已确认校审拒绝;移动属于新修订,必须备注。"""
+    data = request.get_json(force=True)
+    label = (data.get("point_label") or "").strip()
+    condition = data.get("condition")
+    note = (data.get("note") or "").strip()
+    if condition not in ("on", "off"):
+        return json_error("必须指定 condition=on/off")
+    if not note:
+        return json_error("调整测点位置必须备注理由,并形成新修订", 422)
+    try:
+        x, y = float(data["x"]), float(data["y"])
+    except (KeyError, TypeError, ValueError):
+        return json_error("坐标无法解析")
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,测点位置已锁定;如需调整请先重审", 409)
+    rid = row(conn, "SELECT id FROM leak_runs WHERE survey_id=? AND condition=?",
+              (lid, condition))["id"]
+    pt = row(conn, "SELECT * FROM leak_points WHERE run_id=? AND point_label=?", (rid, label))
+    if not pt:
+        conn.close()
+        return json_error("测点不存在: " + label, 404)
+    conn.execute("UPDATE leak_points SET x=?,y=?,moved=1 WHERE id=?", (x, y, pt["id"]))
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "move", {
+        "condition": condition, "point_label": label,
+        "from": [pt["x"], pt["y"]], "to": [x, y], "note": note},
+        revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 环区与保密边界
+
+@app.route("/api/leak-surveys/<int:lid>/zones", methods=["POST"])
+def add_leak_zone(lid):
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    poly = data.get("polygon")
+    if kind not in ("own", "adjacent"):
+        return json_error("kind 必须为 own(本环服务区)或 adjacent(相邻环区)")
+    if not isinstance(poly, list) or len(poly) < 3:
+        return json_error("多边形至少需要 3 个顶点")
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,环区已锁定;如需调整请先重审", 409)
+    conn.execute("INSERT INTO leak_zones(survey_id,kind,name,polygon_json) VALUES(?,?,?,?)",
+                 (lid, kind, (data.get("name") or "").strip(),
+                  json.dumps([[float(a), float(b)] for a, b in poly])))
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "zone-add", {"kind": kind, "name": data.get("name", "")},
+                   revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-zones/<int:zid>", methods=["DELETE"])
+def delete_leak_zone(zid):
+    conn = get_db()
+    z = row(conn, "SELECT * FROM leak_zones WHERE id=?", (zid,))
+    if not z:
+        conn.close()
+        return json_error("环区不存在", 404)
+    surv = get_leak(conn, z["survey_id"])
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,环区已锁定;如需调整请先重审", 409)
+    conn.execute("DELETE FROM leak_zones WHERE id=?", (zid,))
+    conn.commit()
+    recompute_leak(conn, z["survey_id"])
+    log_leak_event(conn, z["survey_id"], "zone-delete",
+                   {"kind": z["kind"], "name": z["name"]}, revision=surv["revision"])
+    state = leak_state(conn, z["survey_id"])
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/paths", methods=["POST"])
+def add_leak_path(lid):
+    data = request.get_json(force=True)
+    verts = data.get("vertices")
+    if not isinstance(verts, list) or len(verts) < 2:
+        return json_error("保密边界至少需要 2 个顶点")
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,边界已锁定;如需调整请先重审", 409)
+    cur = conn.execute("INSERT INTO leak_paths(survey_id,name,vertices_json) VALUES(?,?,?)",
+                       (lid, (data.get("name") or "").strip(),
+                        json.dumps([[float(a), float(b)] for a, b in verts])))
+    pid = cur.lastrowid
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "path-add", {"path_id": pid, "name": data.get("name", ""),
+                                           "n_vertices": len(verts)},
+                   revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-paths/<int:pid>", methods=["DELETE"])
+def delete_leak_path(pid):
+    conn = get_db()
+    p = row(conn, "SELECT * FROM leak_paths WHERE id=?", (pid,))
+    if not p:
+        conn.close()
+        return json_error("边界不存在", 404)
+    surv = get_leak(conn, p["survey_id"])
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,边界已锁定;如需调整请先重审", 409)
+    conn.execute("DELETE FROM leak_paths WHERE id=?", (pid,))
+    conn.commit()
+    recompute_leak(conn, p["survey_id"])
+    log_leak_event(conn, p["survey_id"], "path-delete", {"path_id": pid, "name": p["name"]},
+                   revision=surv["revision"])
+    state = leak_state(conn, p["survey_id"])
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-paths/<int:pid>/vertices", methods=["PUT"])
+def edit_leak_path(pid):
+    """编辑边界顶点(拖动/加顶点),或拆分为多段。任何调整必须备注并形成新修订。
+
+    body: {action: "vertices", vertices: [[x,y]...], note}
+          {action: "split", at_vertex: k, note}     在第 k 个顶点处拆开
+    """
+    data = request.get_json(force=True)
+    note = (data.get("note") or "").strip()
+    if not note:
+        return json_error("调整保密边界必须备注理由,并形成新修订", 422)
+    conn = get_db()
+    p = row(conn, "SELECT * FROM leak_paths WHERE id=?", (pid,))
+    if not p:
+        conn.close()
+        return json_error("边界不存在", 404)
+    surv = get_leak(conn, p["survey_id"])
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,边界已锁定;如需调整请先重审", 409)
+    action = data.get("action")
+    old_verts = json.loads(p["vertices_json"])
+    new_ids = []
+    if action == "vertices":
+        verts = data.get("vertices")
+        if not isinstance(verts, list) or len(verts) < 2:
+            conn.close()
+            return json_error("边界至少需要 2 个顶点")
+        verts = [[float(a), float(b)] for a, b in verts]
+        conn.execute("UPDATE leak_paths SET vertices_json=? WHERE id=?",
+                     (json.dumps(verts), pid))
+        payload = {"path_id": pid, "name": p["name"], "note": note,
+                   "n_vertices": len(verts)}
+    elif action == "split":
+        if len(old_verts) < 3:
+            conn.close()
+            return json_error("拆分至少需要 3 个顶点(内部顶点处拆开,两段各保留端点)")
+        try:
+            k = int(data.get("at_vertex"))
+        except (TypeError, ValueError):
+            conn.close()
+            return json_error("at_vertex 必须为顶点序号")
+        if not (0 < k < len(old_verts) - 1):
+            conn.close()
+            return json_error("拆分点必须在内部顶点(不含两端)")
+        seg_a, seg_b = old_verts[:k + 1], old_verts[k:]
+        conn.execute("UPDATE leak_paths SET vertices_json=? WHERE id=?",
+                     (json.dumps(seg_a), pid))
+        cur = conn.execute("INSERT INTO leak_paths(survey_id,name,vertices_json) VALUES(?,?,?)",
+                           (p["survey_id"], (p["name"] or "边界") + "·拆分",
+                            json.dumps(seg_b)))
+        new_ids.append(cur.lastrowid)
+        payload = {"path_id": pid, "name": p["name"], "note": note,
+                   "split_at_vertex": k, "new_path_id": new_ids[0]}
+    else:
+        conn.close()
+        return json_error("未知 action(vertices/split)")
+    conn.commit()
+    recompute_leak(conn, p["survey_id"])
+    log_leak_event(conn, p["survey_id"],
+                   "path-edit" if action == "vertices" else "path-split", payload,
+                   revision=surv["revision"])
+    state = leak_state(conn, p["survey_id"])
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 人工改配
+
+@app.route("/api/leak-surveys/<int:lid>/overrides", methods=["POST"])
+def add_leak_override(lid):
+    """人工改配:强制开启测点 ↔ 关闭测点,或取消配对;必须备注,形成新修订。"""
+    data = request.get_json(force=True)
+    on_label = (data.get("on_label") or "").strip()
+    off_label = (data.get("off_label") or "").strip() or None
+    note = (data.get("note") or "").strip()
+    if not on_label:
+        return json_error("缺少开启工况测点号")
+    if not note:
+        return json_error("人工改配必须备注理由,并形成新修订", 422)
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,配对表已锁定;如需改配请先重审", 409)
+    runs = leak_runs(conn, lid)
+    if "on" not in runs:
+        conn.close()
+        return json_error("尚未导入开启工况测次")
+    if not row(conn, "SELECT 1 FROM leak_points WHERE run_id=? AND point_label=?",
+               (runs["on"]["id"], on_label)):
+        conn.close()
+        return json_error("开启测次无测点 " + on_label, 404)
+    if off_label:
+        if "off" not in runs:
+            conn.close()
+            return json_error("尚未导入关闭工况测次")
+        if not row(conn, "SELECT 1 FROM leak_points WHERE run_id=? AND point_label=?",
+                   (runs["off"]["id"], off_label)):
+            conn.close()
+            return json_error("关闭测次无测点 " + off_label, 404)
+    conn.execute(
+        "INSERT INTO leak_pair_overrides(survey_id,on_label,off_label,note) VALUES(?,?,?,?)",
+        (lid, on_label, off_label, note))
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "override",
+                   {"on_label": on_label, "off_label": off_label, "note": note},
+                   revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/overrides/<int:oid>", methods=["DELETE"])
+def delete_leak_override(lid, oid):
+    data = request.get_json(force=True) if request.data else {}
+    note = (data.get("note") or "").strip()
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认,配对表已锁定;如需改配请先重审", 409)
+    ov = row(conn, "SELECT * FROM leak_pair_overrides WHERE id=? AND survey_id=?",
+             (oid, lid))
+    if not ov:
+        conn.close()
+        return json_error("改配记录不存在", 404)
+    conn.execute("DELETE FROM leak_pair_overrides WHERE id=?", (oid,))
+    conn.commit()
+    recompute_leak(conn, lid)
+    log_leak_event(conn, lid, "override-delete",
+                   {"on_label": ov["on_label"], "off_label": ov["off_label"],
+                    "note": note or "撤销改配"},
+                   revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 确认锁定 / 重审
+
+@app.route("/api/leak-surveys/<int:lid>/confirm", methods=["POST"])
+def confirm_leak(lid):
+    """确认:冻结结果,锁定来源测次/配对表/限值/边界;三份导出必须取自此确认结果。"""
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] == "confirmed":
+        conn.close()
+        return json_error("校审已确认", 409)
+    runs = leak_runs(conn, lid)
+    if "on" not in runs or "off" not in runs:
+        conn.close()
+        return json_error("必须先导入开启与关闭两种工况测次才能确认")
+    if not leak_paths(conn, lid):
+        conn.close()
+        return json_error("至少需要一条保密边界才能确认")
+    result = recompute_leak(conn, lid)
+    conn.execute(
+        "UPDATE leak_surveys SET status='confirmed',confirmed_at=datetime('now'),"
+        "source_on_run_id=?,source_off_run_id=? WHERE id=?",
+        (runs["on"]["id"], runs["off"]["id"], lid))
+    conn.commit()
+    log_leak_event(conn, lid, "confirm", {
+        "source_on_run_id": runs["on"]["id"],
+        "source_off_run_id": runs["off"]["id"],
+        "revision": surv["revision"],
+        "fail_length_m": result["stats"]["fail_length_m"]},
+        revision=surv["revision"])
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/leak-surveys/<int:lid>/reopen", methods=["POST"])
+def reopen_leak(lid):
+    """重审:解除锁定,修订号 +1(此后改配/调边界形成更新修订)。"""
+    data = request.get_json(force=True) if request.data else {}
+    note = (data.get("note") or "").strip()
+    conn = get_db()
+    surv = get_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("边界外逸校审不存在", 404)
+    if surv["status"] != "confirmed":
+        conn.close()
+        return json_error("校审尚未确认", 409)
+    conn.execute("UPDATE leak_surveys SET status='draft',confirmed_at=NULL,"
+                 "revision=revision+1 WHERE id=?", (lid,))
+    conn.commit()
+    log_leak_event(conn, lid, "reopen", {"note": note or "重审"})
+    state = leak_state(conn, lid)
+    conn.close()
+    return jsonify(state)
+
+
+# ---------------- 导出(均取自确认结果)
+
+LEAK_STATION_COLOR = {"ok": "#2e9e5b", "fail": "#d24040",
+                      "noconclusion": "#9b59b6", "nodata": "#8a8f98",
+                      "internal": "#4da3ff"}
+LEAK_STATION_TEXT = {"ok": "合格", "fail": "超限", "noconclusion": "无结论",
+                     "nodata": "无数据", "internal": "本环区内"}
+
+
+def confirmed_leak(conn, lid):
+    """读取已确认校审的冻结结果;未确认返回 (None, None)。"""
+    surv = get_leak(conn, lid)
+    if not surv or surv["status"] != "confirmed" or not surv["result_json"]:
+        return None, None
+    return surv, json.loads(surv["result_json"])
+
+
+@app.route("/api/leak-surveys/<int:lid>/export/boundary.svg")
+def export_leak_svg(lid):
+    conn = get_db()
+    surv, result = confirmed_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = leak_state(conn, lid)
+    conn.close()
+    bounds = state["project_bounds"]
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.2f %.2f %.2f %.2f" '
+             'font-family="sans-serif">' % (bounds["min_x"] - 4, bounds["min_y"] - 6,
+                                            bounds["width"] + 8, bounds["height"] + 14)]
+    parts.append("<g opacity='0.35'>%s</g>" % svg_inner(state["venue_svg"]))
+
+    for z in state["zones"]:
+        pts = " ".join("%.2f,%.2f" % (p[0], p[1]) for p in z["polygon"])
+        color = LEAK_ZONE_COLOR[z["kind"]]
+        parts.append("<polygon points='%s' fill='%s' fill-opacity='0.05' stroke='%s' "
+                     "stroke-width='0.35' stroke-dasharray='1.4 0.9'><title>%s:%s</title>"
+                     "</polygon>" % (pts, color, color,
+                                     "本环服务区" if z["kind"] == "own" else "相邻环区",
+                                     z["name"]))
+
+    # 边界按测站状态逐段着色
+    for pr in result["paths"]:
+        for run in pr["runs"]:
+            parts.append("<circle cx='%.2f' cy='%.2f' r='1.1' fill='#d24040'>"
+                         "<title>峰值外逸 %.1f dB @ %.1f m</title></circle>"
+                         % (run["peak_x"], run["peak_y"], run["peak_excess"], run["peak_s"]))
+        verts = pr["vertices"]
+        ss, length = leakage.cumulative_lengths(verts)
+        seg = []
+        for st in pr["stations"]:
+            x, y = leakage.point_at_s(verts, ss, st["s"])
+            seg.append((x, y, st["status"]))
+        for k in range(len(seg) - 1):
+            color = LEAK_STATION_COLOR.get(seg[k][2], "#888")
+            dash = "1 0" if seg[k][2] in ("fail", "ok", "internal") else "0.8 0.6"
+            parts.append("<line x1='%.2f' y1='%.2f' x2='%.2f' y2='%.2f' stroke='%s' "
+                         "stroke-width='0.8' stroke-dasharray='%s'><title>%.1f m %s</title>"
+                         "</line>"
+                         % (seg[k][0], seg[k][1], seg[k + 1][0], seg[k + 1][1],
+                            color, dash, pr["stations"][k]["s"],
+                            LEAK_STATION_TEXT.get(seg[k][2], seg[k][2])))
+        for i, (vx, vy) in enumerate(verts):
+            parts.append("<rect x='%.2f' y='%.2f' width='0.7' height='0.7' fill='#cfd6e2'>"
+                         "<title>%s 顶点 %d</title></rect>"
+                         % (vx - 0.35, vy - 0.35, pr["name"], i))
+
+    # 配对测点
+    for p in result["pairs"]:
+        color = "#9b59b6" if p["status"] == "noconclusion" else "#2e9e5b"
+        parts.append("<circle cx='%.2f' cy='%.2f' r='0.55' fill='%s' stroke='#fff' "
+                     "stroke-width='0.15'><title>%s↔%s %s</title></circle>"
+                     % (p["x"], p["y"], color, p["on_label"], p["off_label"],
+                        "/".join(leakage.reason_text(r) for r in p["reasons"]) or "配对有效"))
+        if p["method"] == "manual":
+            parts.append("<circle cx='%.2f' cy='%.2f' r='0.95' fill='none' "
+                         "stroke='#ffd75e' stroke-width='0.22'/>" % (p["x"], p["y"]))
+    for a in result["ambiguous"]:
+        if a["x"] is None:
+            continue
+        parts.append("<rect x='%.2f' y='%.2f' width='1' height='1' fill='none' "
+                     "stroke='#9b59b6' stroke-width='0.22'><title>%s 配对多解,候选:%s"
+                     "</title></rect>"
+                     % (a["x"] - 0.5, a["y"] - 0.5, a["label"], "/".join(a["candidates"])))
+
+    legend = [("#2e9e5b", "合格"), ("#d24040", "超限外逸"), ("#9b59b6", "无结论"),
+              ("#8a8f98", "无数据"), ("#4da3ff", "本环服务区"),
+              ("#f0932b", "相邻环区")]
+    lx, ly = bounds["min_x"], bounds["min_y"] + bounds["height"] + 2
+    for i, (color, txt) in enumerate(legend):
+        parts.append("<rect x='%.2f' y='%.2f' width='2' height='2' fill='%s'/>"
+                     "<text x='%.2f' y='%.2f' font-size='2.2' fill='#222'>%s</text>"
+                     % (lx + i * 13, ly, color, lx + i * 13 + 2.6, ly + 1.8, txt))
+    stt = result["stats"]
+    peak = stt["peak"] or {}
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.4' fill='#222'>%s · %s · 修订 %d · "
+                 "超限 %.1f m / 共 %.1f m · 峰值 %.1f dB@%.1f m</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 3.2, state["project_name"],
+                    state["label"], state["revision"],
+                    stt["fail_length_m"], stt["total_length_m"],
+                    peak.get("excess", 0) or 0, peak.get("s", 0) or 0))
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.0' fill='#222'>外逸限值 %.1f dB · "
+                 "边界外绝对场强 ≤ %.1f dB · 确认于 %s</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 0.8,
+                    result["params"]["leak_limit_db"], result["params"]["max_field_db"],
+                    state["confirmed_at"] or ""))
+    parts.append("</svg>")
+    return Response("".join(parts), mimetype="image/svg+xml", headers={
+        "Content-Disposition": "attachment; filename=boundary_l%s_r%d.svg"
+                               % (lid, state["revision"])})
+
+
+@app.route("/api/leak-surveys/<int:lid>/export/remeasure.csv")
+def export_leak_csv(lid):
+    conn = get_db()
+    surv, result = confirmed_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    conn.close()
+    head = ["path_id", "path_name", "kind", "s_m", "x", "y", "status",
+            "excess_db", "on_field_db", "background_db", "adj_margin_db",
+            "n_pairs", "reasons"]
+    lines = [",".join(head)]
+
+    def q(s):
+        return '"%s"' % str(s).replace('"', '""') if s else ""
+
+    # 复测点:全部超限站 + 无结论/无数据站(前者复测整改、后者补证据)
+    for pr in result["paths"]:
+        for st in pr["stations"]:
+            if st["status"] not in ("fail", "noconclusion", "nodata"):
+                continue
+            lines.append(",".join([
+                str(pr["id"]), q(pr["name"]), st["status"],
+                "%.2f" % st["s"], "%.2f" % st["x"], "%.2f" % st["y"],
+                st["status"],
+                "" if st["excess"] is None else "%.2f" % st["excess"],
+                "" if st["on_field"] is None else "%.2f" % st["on_field"],
+                "" if st["background"] is None else "%.2f" % st["background"],
+                "" if st["adj_margin"] is None else "%.2f" % st["adj_margin"],
+                str(st["n_pairs"]),
+                q(";".join(leakage.reason_text(r) for r in st["reasons"]))]))
+    lines.append("# total_length_m,%.2f" % result["stats"]["total_length_m"])
+    lines.append("# fail_length_m,%.2f" % result["stats"]["fail_length_m"])
+    lines.append("# noconclusion_length_m,%.2f" % result["stats"]["noconclusion_length_m"])
+    return Response("﻿" + "\n".join(lines), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=boundary_remeasure_l%s_r%d.csv"
+                               % (lid, surv["revision"])})
+
+
+@app.route("/api/leak-surveys/<int:lid>/export/recalc.json")
+def export_leak_json(lid):
+    conn = get_db()
+    surv, result = confirmed_leak(conn, lid)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = leak_state(conn, lid)
+    conn.close()
+    payload = {
+        "survey": {k: state[k] for k in
+                   ("id", "project_id", "project_name", "label", "status", "revision",
+                    "own_loop", "adjacent_loop", "created_at", "confirmed_at",
+                    "source_on_run_id", "source_off_run_id")},
+        "runs": [{k: r[k] for k in
+                  ("id", "condition", "label", "time_text", "time_iso",
+                   "device_id", "n_points")} for r in state["runs"]],
+        "zones": state["zones"],
+        "paths_meta": [{"id": p["id"], "name": p["name"],
+                        "n_vertices": len(p["vertices"])} for p in state["paths"]],
+        "params": state["params"],
+        "overrides": state["overrides"],
+        "events": state["events"],
+        "result": result,
+        "nc_text": leakage.NC_TEXT,
+    }
+    return Response(json.dumps(payload, ensure_ascii=False, indent=1),
+                    mimetype="application/json", headers={
+                        "Content-Disposition": "attachment; filename=boundary_recalc_l%s_r%d.json"
+                                               % (lid, state["revision"])})
 
 
 if __name__ == "__main__":
