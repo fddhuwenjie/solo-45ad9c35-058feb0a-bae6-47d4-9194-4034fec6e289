@@ -2,13 +2,14 @@
 
 职责:解析测量 CSV、空间计算(调用 survey.spatial)、SQLite 版本存取、
 限值校核、增量重算、补测路径规划与三类导出(覆盖 SVG / 补测清单 / 复算 JSON)。
+复测对照:跨轮次配对与差异计算(调用 survey.compare),确认后冻结结果并导出。
 """
 import json
 import re
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from survey import csvio, spatial
+from survey import compare, csvio, spatial
 from survey.db import get_db, init_db, row, rows
 
 app = Flask(__name__)
@@ -188,6 +189,11 @@ def json_error(msg, code=400):
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/compare")
+def compare_page():
+    return render_template("compare.html")
 
 
 # ---------------------------------------------------------------- 项目
@@ -602,6 +608,483 @@ def export_recalc(vid):
     return Response(json.dumps(payload, ensure_ascii=False, indent=1),
                     mimetype="application/json", headers={
                         "Content-Disposition": "attachment; filename=recalc_v%s.json" % vid})
+
+
+# ---------------------------------------------------------------- 复测对照
+
+CONDITION_FIELDS = ("base_occ", "base_lighting", "base_pa",
+                    "retest_occ", "retest_lighting", "retest_pa")
+
+
+def log_c_event(conn, cid, kind, payload):
+    conn.execute("INSERT INTO comparison_events(comparison_id,kind,payload_json) "
+                 "VALUES(?,?,?)", (cid, kind, json.dumps(payload, ensure_ascii=False)))
+    conn.commit()
+
+
+def recompute_comparison(conn, cid):
+    """按当前配对表(自动 + 人工改配)重算对照结果并写入 result_json。"""
+    comp = row(conn, "SELECT * FROM comparisons WHERE id=?", (cid,))
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (comp["project_id"],))
+    bounds = json.loads(proj["bounds_json"])
+    limits = get_limits(conn, comp["project_id"])
+    base_pts = load_points(conn, comp["base_version_id"], limits, bounds)
+    retest_pts = load_points(conn, comp["retest_version_id"], limits, bounds)
+    overrides = rows(conn, "SELECT base_label,retest_label,note FROM pair_overrides "
+                           "WHERE comparison_id=? ORDER BY id", (cid,))
+    result = compare.compute_comparison(base_pts, retest_pts, limits, bounds,
+                                        pos_tol=comp["pos_tol"], overrides=overrides)
+    conn.execute("UPDATE comparisons SET result_json=? WHERE id=?",
+                 (json.dumps(result, ensure_ascii=False), cid))
+    conn.commit()
+
+
+def comparison_state(conn, cid):
+    comp = row(conn, "SELECT * FROM comparisons WHERE id=?", (cid,))
+    if not comp:
+        return None
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (comp["project_id"],))
+    vers = {v["id"]: v for v in rows(
+        conn, "SELECT id,label,created_at FROM versions WHERE project_id=? ORDER BY id",
+        (comp["project_id"],))}
+    max_vid = max(vers) if vers else 0
+    stale = bool(comp["status"] == "confirmed"
+                 and comp["source_max_version_id"] is not None
+                 and max_vid > comp["source_max_version_id"])
+    overrides = rows(conn, "SELECT * FROM pair_overrides WHERE comparison_id=? "
+                           "ORDER BY id", (cid,))
+    events = rows(conn, "SELECT * FROM comparison_events WHERE comparison_id=? "
+                        "ORDER BY id DESC LIMIT 50", (cid,))
+    for e in events:
+        e["payload"] = json.loads(e.pop("payload_json"))
+    return {
+        "id": comp["id"], "project_id": comp["project_id"],
+        "project_name": proj["name"],
+        "label": comp["label"], "status": comp["status"],
+        "conditions": {k: comp[k] for k in CONDITION_FIELDS},
+        "pos_tol": comp["pos_tol"],
+        "base_version": vers.get(comp["base_version_id"]),
+        "retest_version": vers.get(comp["retest_version_id"]),
+        "base_version_id": comp["base_version_id"],
+        "retest_version_id": comp["retest_version_id"],
+        "created_at": comp["created_at"], "confirmed_at": comp["confirmed_at"],
+        "stale": stale,
+        "result": json.loads(comp["result_json"]) if comp["result_json"] else None,
+        "overrides": overrides, "events": events,
+        "migration_text": compare.MIGRATION_TEXT,
+        "nc_text": compare.NC_TEXT,
+        "project_bounds": json.loads(proj["bounds_json"]),
+        "venue_svg": proj["venue_svg"],
+    }
+
+
+def get_comparison(conn, cid):
+    return row(conn, "SELECT * FROM comparisons WHERE id=?", (cid,))
+
+
+@app.route("/api/projects/<int:pid>/comparisons", methods=["GET"])
+def list_comparisons(pid):
+    conn = get_db()
+    comps = rows(conn, "SELECT * FROM comparisons WHERE project_id=? ORDER BY id DESC",
+                 (pid,))
+    max_vid = row(conn, "SELECT MAX(id) AS m FROM versions WHERE project_id=?",
+                  (pid,))["m"] or 0
+    vers = {v["id"]: v["label"] for v in rows(
+        conn, "SELECT id,label FROM versions WHERE project_id=?", (pid,))}
+    out = []
+    for c in comps:
+        result = json.loads(c["result_json"]) if c["result_json"] else None
+        out.append({
+            "id": c["id"], "label": c["label"], "status": c["status"],
+            "base_version_id": c["base_version_id"],
+            "retest_version_id": c["retest_version_id"],
+            "base_label": vers.get(c["base_version_id"], "?"),
+            "retest_label": vers.get(c["retest_version_id"], "?"),
+            "created_at": c["created_at"], "confirmed_at": c["confirmed_at"],
+            "stale": bool(c["status"] == "confirmed"
+                          and c["source_max_version_id"] is not None
+                          and max_vid > c["source_max_version_id"]),
+            "stats": result["stats"] if result else None,
+        })
+    conn.close()
+    return jsonify(out)
+
+
+@app.route("/api/projects/<int:pid>/comparisons", methods=["POST"])
+def create_comparison(pid):
+    data = request.get_json(force=True)
+    try:
+        base_vid, retest_vid = int(data["base_version_id"]), int(data["retest_version_id"])
+    except (KeyError, TypeError, ValueError):
+        return json_error("必须指定基准轮次与复测轮次")
+    if base_vid == retest_vid:
+        return json_error("基准轮次与复测轮次不能相同")
+    conn = get_db()
+    vers = {v["id"] for v in rows(
+        conn, "SELECT id FROM versions WHERE project_id=?", (pid,))}
+    if base_vid not in vers or retest_vid not in vers:
+        conn.close()
+        return json_error("所选轮次不属于本项目", 404)
+    cond = {k: (data.get(k) or "").strip() for k in CONDITION_FIELDS}
+    pos_tol = float(data.get("pos_tol") or 1.0)
+    if pos_tol <= 0:
+        conn.close()
+        return json_error("位置容差必须为正")
+    cur = conn.execute(
+        "INSERT INTO comparisons(project_id,base_version_id,retest_version_id,label,"
+        "base_occ,base_lighting,base_pa,retest_occ,retest_lighting,retest_pa,pos_tol) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, base_vid, retest_vid,
+         (data.get("label") or "").strip()
+         or "对照 #%s→#%s" % (base_vid, retest_vid),
+         cond["base_occ"], cond["base_lighting"], cond["base_pa"],
+         cond["retest_occ"], cond["retest_lighting"], cond["retest_pa"], pos_tol))
+    cid = cur.lastrowid
+    conn.commit()
+    recompute_comparison(conn, cid)
+    log_c_event(conn, cid, "create", {
+        "base_version_id": base_vid, "retest_version_id": retest_vid,
+        "pos_tol": pos_tol, "conditions": cond})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>")
+def get_comparison_state(cid):
+    conn = get_db()
+    state = comparison_state(conn, cid)
+    conn.close()
+    if not state:
+        return json_error("对照不存在", 404)
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/conditions", methods=["PUT"])
+def update_conditions(cid):
+    data = request.get_json(force=True)
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    if comp["status"] == "confirmed":
+        conn.close()
+        return json_error("对照已确认,工况与配对参数已锁定;如需修改请先重审", 409)
+    cond = {k: (data.get(k) or "").strip() for k in CONDITION_FIELDS}
+    pos_tol = float(data.get("pos_tol") or comp["pos_tol"])
+    if pos_tol <= 0:
+        conn.close()
+        return json_error("位置容差必须为正")
+    label = (data.get("label") or comp["label"]).strip()
+    conn.execute(
+        "UPDATE comparisons SET label=?,base_occ=?,base_lighting=?,base_pa=?,"
+        "retest_occ=?,retest_lighting=?,retest_pa=?,pos_tol=? WHERE id=?",
+        (label, cond["base_occ"], cond["base_lighting"], cond["base_pa"],
+         cond["retest_occ"], cond["retest_lighting"], cond["retest_pa"], pos_tol, cid))
+    conn.commit()
+    recompute_comparison(conn, cid)
+    log_c_event(conn, cid, "conditions", {"label": label, "pos_tol": pos_tol,
+                                          "conditions": cond})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/overrides", methods=["POST"])
+def add_override(cid):
+    """人工改配:强制配对/取消配对,必须备注理由。"""
+    data = request.get_json(force=True)
+    base_label = (data.get("base_label") or "").strip()
+    retest_label = (data.get("retest_label") or "").strip() or None
+    note = (data.get("note") or "").strip()
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    if comp["status"] == "confirmed":
+        conn.close()
+        return json_error("对照已确认,配对表已锁定;如需改配请先重审", 409)
+    if not base_label:
+        conn.close()
+        return json_error("缺少基准测点")
+    if not note:
+        conn.close()
+        return json_error("人工改配必须备注理由", 422)
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (comp["project_id"],))
+    bounds = json.loads(proj["bounds_json"])
+    limits = get_limits(conn, comp["project_id"])
+    base_labels = {p["label"] for p in load_points(conn, comp["base_version_id"], limits, bounds)}
+    retest_labels = {p["label"] for p in load_points(conn, comp["retest_version_id"], limits, bounds)}
+    if base_label not in base_labels:
+        conn.close()
+        return json_error("基准轮无测点 " + base_label, 404)
+    if retest_label and retest_label not in retest_labels:
+        conn.close()
+        return json_error("复测轮无测点 " + retest_label, 404)
+    conn.execute("INSERT INTO pair_overrides(comparison_id,base_label,retest_label,note) "
+                 "VALUES(?,?,?,?)", (cid, base_label, retest_label, note))
+    conn.commit()
+    recompute_comparison(conn, cid)
+    log_c_event(conn, cid, "override", {
+        "base_label": base_label, "retest_label": retest_label, "note": note})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/overrides/<int:oid>", methods=["DELETE"])
+def delete_override(cid, oid):
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    if comp["status"] == "confirmed":
+        conn.close()
+        return json_error("对照已确认,配对表已锁定;如需改配请先重审", 409)
+    ov = row(conn, "SELECT * FROM pair_overrides WHERE id=? AND comparison_id=?",
+             (oid, cid))
+    if not ov:
+        conn.close()
+        return json_error("改配记录不存在", 404)
+    conn.execute("DELETE FROM pair_overrides WHERE id=?", (oid,))
+    conn.commit()
+    recompute_comparison(conn, cid)
+    log_c_event(conn, cid, "override-delete", {
+        "base_label": ov["base_label"], "retest_label": ov["retest_label"]})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/confirm", methods=["POST"])
+def confirm_comparison(cid):
+    """确认:冻结结果,锁定来源轮次与配对表;此后来源派生新修订将提示重审。"""
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    if comp["status"] == "confirmed":
+        conn.close()
+        return json_error("对照已确认", 409)
+    max_vid = row(conn, "SELECT MAX(id) AS m FROM versions WHERE project_id=?",
+                  (comp["project_id"],))["m"] or 0
+    conn.execute("UPDATE comparisons SET status='confirmed',"
+                 "confirmed_at=datetime('now'),source_max_version_id=? WHERE id=?",
+                 (max_vid, cid))
+    conn.commit()
+    log_c_event(conn, cid, "confirm", {"source_max_version_id": max_vid})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/reopen", methods=["POST"])
+def reopen_comparison(cid):
+    """重审:解除锁定回到草稿,可改配/调参后重新确认。"""
+    data = request.get_json(force=True) if request.data else {}
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    if comp["status"] != "confirmed":
+        conn.close()
+        return json_error("对照尚未确认", 409)
+    conn.execute("UPDATE comparisons SET status='draft',confirmed_at=NULL WHERE id=?",
+                 (cid,))
+    conn.commit()
+    log_c_event(conn, cid, "reopen", {"reason": (data.get("reason") or "").strip()})
+    state = comparison_state(conn, cid)
+    conn.close()
+    return jsonify(state)
+
+
+@app.route("/api/comparisons/<int:cid>/raw")
+def comparison_raw(cid):
+    """反查两轮原始记录:?labels=P01,P02(如成片退化席位区的成员)。"""
+    labels = [s for s in (request.args.get("labels") or "").split(",") if s.strip()]
+    if not labels:
+        return json_error("缺少 labels 参数")
+    conn = get_db()
+    comp = get_comparison(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照不存在", 404)
+    q = ",".join("?" * len(labels))
+
+    def fetch(vid):
+        return rows(conn, "SELECT point_label,x,y,freq_hz,field_db,noise_db,"
+                          "device_id,calib_version,locked,excluded,exclude_reason "
+                          "FROM measurements WHERE version_id=? AND point_label IN (%s) "
+                          "ORDER BY point_label,freq_hz" % q, (vid, *labels))
+    out = {
+        "base_version_id": comp["base_version_id"],
+        "retest_version_id": comp["retest_version_id"],
+        "base": fetch(comp["base_version_id"]),
+        "retest": fetch(comp["retest_version_id"]),
+    }
+    conn.close()
+    return jsonify(out)
+
+
+# ---------------------------------------------------------------- 复测对照导出(均取自同一确认结果)
+
+MIGRATION_COLOR = {"ok->fail": "#d24040", "fail->ok": "#2e9e5b",
+                   "ok->ok": "#1c6dd9", "fail->fail": "#d8a012"}
+
+
+def confirmed_result(conn, cid):
+    """读取已确认对照的冻结结果;未确认返回 None。"""
+    comp = get_comparison(conn, cid)
+    if not comp or comp["status"] != "confirmed" or not comp["result_json"]:
+        return None, None
+    return comp, json.loads(comp["result_json"])
+
+
+@app.route("/api/comparisons/<int:cid>/export/diff.svg")
+def export_diff_svg(cid):
+    conn = get_db()
+    comp, result = confirmed_result(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照结果尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = comparison_state(conn, cid)
+    conn.close()
+    bounds = state["project_bounds"]
+    cond = state["conditions"]
+
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.2f %.2f %.2f %.2f" '
+             'font-family="sans-serif">' % (bounds["min_x"] - 4, bounds["min_y"] - 6,
+                                            bounds["width"] + 8, bounds["height"] + 14)]
+    parts.append("<g opacity='0.35'>%s</g>" % svg_inner(state["venue_svg"]))
+    for cl in result["clusters"]:
+        if not cl["clustered"]:
+            continue
+        parts.append("<circle cx='%.2f' cy='%.2f' r='%.2f' fill='rgba(210,64,64,.10)' "
+                     "stroke='#d24040' stroke-width='0.3' stroke-dasharray='1.4 0.9'>"
+                     "<title>成片退化席位区 #%d:%d 个位置</title></circle>"
+                     % (cl["x"], cl["y"], 2.0 + 1.2 * cl["n"], cl["id"], cl["n"]))
+    for p in result["pairs"]:
+        if p["status"] == "noconclusion":
+            color = "#9b59b6"
+        else:
+            color = MIGRATION_COLOR.get(p["migration"]["overall"], "#888")
+        if p.get("dist") and p["dist"] > 0.3:
+            parts.append("<line x1='%.2f' y1='%.2f' x2='%.2f' y2='%.2f' stroke='%s' "
+                         "stroke-width='0.2' stroke-dasharray='0.6 0.5'/>"
+                         % (p["x"], p["y"], p["rx"], p["ry"], color))
+        parts.append("<circle cx='%.2f' cy='%.2f' r='0.6' fill='%s' stroke='#fff' "
+                     "stroke-width='0.15'><title>%s→%s %s</title></circle>"
+                     % (p["x"], p["y"], color, p["base_label"], p["retest_label"],
+                        p["reason"] or compare.MIGRATION_TEXT.get(
+                            (p["migration"] or {}).get("overall"), "")))
+        if p["method"] == "manual":
+            parts.append("<circle cx='%.2f' cy='%.2f' r='1.0' fill='none' "
+                         "stroke='#ffd75e' stroke-width='0.25'/>" % (p["x"], p["y"]))
+    legend = [("#d24040", "退化"), ("#2e9e5b", "改善"), ("#1c6dd9", "保持合格"),
+              ("#d8a012", "保持不合格"), ("#9b59b6", "无结论")]
+    lx, ly = bounds["min_x"], bounds["min_y"] + bounds["height"] + 2
+    for i, (color, txt) in enumerate(legend):
+        parts.append("<rect x='%.2f' y='%.2f' width='2' height='2' fill='%s'/>"
+                     "<text x='%.2f' y='%.2f' font-size='2.2' fill='#222'>%s</text>"
+                     % (lx + i * 14, ly, color, lx + i * 14 + 2.6, ly + 1.8, txt))
+    cond_txt = "基准[%s/%s/%s] 复测[%s/%s/%s]" % (
+        cond["base_occ"] or "—", cond["base_lighting"] or "—", cond["base_pa"] or "—",
+        cond["retest_occ"] or "—", cond["retest_lighting"] or "—", cond["retest_pa"] or "—")
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.2' fill='#222'>%s · %s · 基准 #%s %s / 复测 #%s %s</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 3.2, state["project_name"],
+                    state["label"], comp["base_version_id"],
+                    (state["base_version"] or {}).get("label", ""),
+                    comp["retest_version_id"],
+                    (state["retest_version"] or {}).get("label", "")))
+    parts.append("<text x='%.2f' y='%.2f' font-size='2.0' fill='#222'>工况(客席/灯光/扩声)%s%s</text>"
+                 % (bounds["min_x"], bounds["min_y"] - 0.8, cond_txt,
+                    " · ⚠来源已派生新修订,待重审" if state["stale"] else ""))
+    parts.append("</svg>")
+    return Response("".join(parts), mimetype="image/svg+xml", headers={
+        "Content-Disposition": "attachment; filename=diff_c%s.svg" % cid})
+
+
+@app.route("/api/comparisons/<int:cid>/export/detail.csv")
+def export_compare_csv(cid):
+    conn = get_db()
+    comp, result = confirmed_result(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照结果尚未确认,三份导出材料必须取自同一确认结果", 409)
+    conn.close()
+    head = ["pair_key", "base_label", "retest_label", "x", "y", "method", "status",
+            "reason", "freq_hz", "base_field_db", "retest_field_db", "delta_field_db",
+            "base_noise_db", "retest_noise_db", "delta_noise_db",
+            "base_field_margin_db", "retest_field_margin_db", "delta_field_margin_db",
+            "base_snr_margin_db", "retest_snr_margin_db", "delta_snr_margin_db",
+            "migration_overall", "manual_note"]
+    lines = [",".join(head)]
+
+    def q(s):
+        return '"%s"' % str(s).replace('"', '""') if s else ""
+
+    for p in result["pairs"]:
+        common = [p["key"], p["base_label"], p["retest_label"],
+                  "%.2f" % p["x"], "%.2f" % p["y"], p["method"], p["status"],
+                  q(p["reason"])]
+        if p["status"] == "noconclusion":
+            lines.append(",".join(common + [""] * 13 + ["", q(p["manual_note"])]))
+            continue
+        mig = p["migration"]["overall"]
+        for f in p["freqs"]:
+            lines.append(",".join(common + [
+                "%g" % f["freq"], "%.2f" % f["base_field"], "%.2f" % f["retest_field"],
+                "%.2f" % f["delta_field"], "%.2f" % f["base_noise"],
+                "%.2f" % f["retest_noise"], "%.2f" % f["delta_noise"],
+                "%.2f" % f["base_field_margin"], "%.2f" % f["retest_field_margin"],
+                "%.2f" % f["delta_field_margin"], "%.2f" % f["base_snr_margin"],
+                "%.2f" % f["retest_snr_margin"], "%.2f" % f["delta_snr_margin"],
+                mig, q(p["manual_note"])]))
+    for a in result["ambiguous"]:
+        lines.append(",".join([a["label"], a["label"], "", "", "", "", "noconclusion",
+                               q("多重匹配,候选:" + "/".join(a["candidates"]))]
+                              + [""] * 15))
+    for side, labels in (("base_only", result["unpaired"]["base_only"]),
+                         ("retest_only", result["unpaired"]["retest_only"])):
+        for lb in labels:
+            lines.append(",".join([lb, lb if side == "base_only" else "",
+                                   lb if side == "retest_only" else "",
+                                   "", "", "", "unpaired", q(side)] + [""] * 15))
+    return Response("﻿" + "\n".join(lines), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=compare_detail_c%s.csv" % cid})
+
+
+@app.route("/api/comparisons/<int:cid>/export/recalc.json")
+def export_compare_json(cid):
+    conn = get_db()
+    comp, result = confirmed_result(conn, cid)
+    if not comp:
+        conn.close()
+        return json_error("对照结果尚未确认,三份导出材料必须取自同一确认结果", 409)
+    state = comparison_state(conn, cid)
+    conn.close()
+    payload = {
+        "comparison": {k: state[k] for k in
+                       ("id", "project_id", "project_name", "label", "status",
+                        "base_version_id", "retest_version_id", "pos_tol",
+                        "created_at", "confirmed_at", "stale")},
+        "base_version": state["base_version"],
+        "retest_version": state["retest_version"],
+        "conditions": state["conditions"],
+        "stale_notice": "来源轮次在确认后派生了新修订,结论需重审" if state["stale"] else "",
+        "overrides": state["overrides"],
+        "events": state["events"],
+        "migration_text": state["migration_text"],
+        "result": result,
+    }
+    return Response(json.dumps(payload, ensure_ascii=False, indent=1),
+                    mimetype="application/json", headers={
+                        "Content-Disposition": "attachment; filename=compare_recalc_c%s.json" % cid})
 
 
 if __name__ == "__main__":

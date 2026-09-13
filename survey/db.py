@@ -1,4 +1,4 @@
-"""SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定。"""
+"""SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定、复测对照。"""
 import os
 import sqlite3
 
@@ -71,6 +71,36 @@ CREATE TABLE IF NOT EXISTS grid_cells(
 CREATE TABLE IF NOT EXISTS decisions(
   id INTEGER PRIMARY KEY,
   version_id INTEGER NOT NULL REFERENCES versions(id),
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS comparisons(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  base_version_id INTEGER NOT NULL REFERENCES versions(id),
+  retest_version_id INTEGER NOT NULL REFERENCES versions(id),
+  label TEXT DEFAULT '',
+  base_occ TEXT DEFAULT '', base_lighting TEXT DEFAULT '', base_pa TEXT DEFAULT '',
+  retest_occ TEXT DEFAULT '', retest_lighting TEXT DEFAULT '', retest_pa TEXT DEFAULT '',
+  pos_tol REAL DEFAULT 1.0,
+  status TEXT DEFAULT 'draft',
+  result_json TEXT,
+  source_max_version_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  confirmed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pair_overrides(
+  id INTEGER PRIMARY KEY,
+  comparison_id INTEGER NOT NULL REFERENCES comparisons(id),
+  base_label TEXT NOT NULL,
+  retest_label TEXT,
+  note TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS comparison_events(
+  id INTEGER PRIMARY KEY,
+  comparison_id INTEGER NOT NULL REFERENCES comparisons(id),
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at TEXT DEFAULT (datetime('now'))

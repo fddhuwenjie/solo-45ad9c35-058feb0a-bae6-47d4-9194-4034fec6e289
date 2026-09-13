@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>复测对照 — 助听感应环巡测校审</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>复测对照</h1>
+  <span id="projName" class="proj"></span>
+  <span id="cmpBadge" class="badge"></span>
+  <div class="spacer"></div>
+  <label class="hdr">对照</label>
+  <select id="cmpSelect"></select>
+  <button id="btnConfirm" title="确认后锁定来源轮次与配对表">确认结果</button>
+  <button id="btnReopen" class="hidden" title="解除锁定,重新审阅">重审</button>
+  <button id="btnExpSvg" title="导出差异 SVG(取自确认结果)">差异 SVG</button>
+  <button id="btnExpCsv" title="导出明细 CSV(取自确认结果)">明细 CSV</button>
+  <button id="btnExpJson" title="导出复算 JSON(取自确认结果)">复算 JSON</button>
+  <a href="/" class="hdr-link">← 返回校审</a>
+</header>
+
+<div id="staleBar" class="hidden"></div>
+
+<div id="noProject" class="hidden">
+  <div class="setup-card">
+    <h2>复测对照</h2>
+    <p>请先在<a href="/">校审页</a>创建项目并导入至少两轮巡测数据。</p>
+  </div>
+</div>
+
+<main id="main" class="hidden">
+  <aside id="left">
+    <section class="panel">
+      <h3>对照设置</h3>
+      <label class="fld">基准轮次 <select id="selBase"></select></label>
+      <label class="fld">复测轮次 <select id="selRetest"></select></label>
+      <label class="fld">对照名称 <input id="cmpLabel" placeholder="如:满场演出工况复测"></label>
+      <label class="fld">位置容差 m <input id="posTol" type="number" step="0.1" min="0.1" value="1.0"></label>
+      <table class="cond">
+        <tr><th>工况</th><th>基准轮</th><th>复测轮</th></tr>
+        <tr><td>客席占用</td>
+          <td><input id="baseOcc" list="occOpt" placeholder="空场/半满/满场"></td>
+          <td><input id="retestOcc" list="occOpt" placeholder="空场/半满/满场"></td></tr>
+        <tr><td>灯光</td>
+          <td><input id="baseLighting" list="lightOpt" placeholder="工作灯/调光"></td>
+          <td><input id="retestLighting" list="lightOpt" placeholder="工作灯/调光"></td></tr>
+        <tr><td>扩声</td>
+          <td><input id="basePa" list="paOpt" placeholder="开启/关闭"></td>
+          <td><input id="retestPa" list="paOpt" placeholder="开启/关闭"></td></tr>
+      </table>
+      <datalist id="occOpt"><option>空场</option><option>半满</option><option>满场</option></datalist>
+      <datalist id="lightOpt"><option>工作灯全开</option><option>演出调光</option><option>关闭</option></datalist>
+      <datalist id="paOpt"><option>开启</option><option>关闭</option></datalist>
+      <div class="btnrow">
+        <button id="btnCreate">新建对照</button>
+        <button id="btnSaveCond">保存工况/参数</button>
+      </div>
+      <p class="hint">同一场地的两轮巡测间建立对照;确认后工况与配对表锁定。</p>
+    </section>
+
+    <section class="panel">
+      <h3>人工改配</h3>
+      <input id="ovBase" placeholder="基准测点号">
+      <input id="ovRetest" placeholder="复测测点号(留空 = 取消配对)">
+      <input id="ovNote" placeholder="备注理由(必填)">
+      <button id="btnOverride">提交改配</button>
+      <ul id="overrideList" class="list small"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>配对列表 <span id="pairCount" class="dim"></span></h3>
+      <ul id="pairList" class="list scroll"></ul>
+    </section>
+
+    <section class="panel grow">
+      <h3>事件记录</h3>
+      <ul id="eventList" class="list scroll small"></ul>
+    </section>
+  </aside>
+
+  <section id="viewportWrap">
+    <svg id="viewport" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="viewMode">
+      <button data-mode="overlay" class="active">叠放</button><button data-mode="base">基准轮</button><button data-mode="retest">复测轮</button>
+    </div>
+    <div id="legend"></div>
+    <div id="tooltip" class="hidden"></div>
+    <div id="statusbar">就绪</div>
+  </section>
+
+  <aside id="right">
+    <section class="panel">
+      <h3>对照统计</h3>
+      <div id="stats"></div>
+    </section>
+    <section class="panel">
+      <h3>选中配对 <span id="pairTitle" class="dim"></span></h3>
+      <div id="pairDetail"><p class="dim">在平面图或配对列表中点击选择</p></div>
+    </section>
+    <section class="panel">
+      <h3>频响对照曲线</h3>
+      <svg id="spectrum" viewBox="0 0 340 230"></svg>
+    </section>
+    <section class="panel grow">
+      <h3>成片退化席位区</h3>
+      <ul id="clusterList" class="list scroll small"></ul>
+    </section>
+    <section class="panel grow">
+      <h3>两轮原始记录 <button id="btnRaw" class="mini">反查选中配对/区域</button></h3>
+      <div id="rawBox" class="rawbox"><p class="dim">选择配对或退化区后反查</p></div>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/compare.js"></script>
+</body>
+</html>

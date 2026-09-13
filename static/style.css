@@ -122,3 +122,35 @@ aside { width: 265px; overflow-y: auto; padding: 8px; display: flex; flex-direct
 .setup-card h2 { margin-top: 0; }
 .setup-card label { display: block; margin-bottom: 10px; }
 .setup-card input { width: 100%; margin-top: 3px; }
+
+/* ---------------- 复测对照工作区 ---------------- */
+.hdr-link { color: var(--accent); text-decoration: none; font-size: 12px; }
+.hdr-link:hover { text-decoration: underline; }
+#staleBar {
+  padding: 5px 14px; background: rgba(210,64,64,.16); color: #ff9a9a;
+  border-bottom: 1px solid var(--fail); font-size: 12px;
+}
+#viewMode {
+  position: absolute; right: 10px; top: 10px; display: flex; gap: 4px;
+  background: rgba(20,23,28,.88); border: 1px solid var(--line); border-radius: 6px; padding: 4px;
+}
+#viewMode button { float: none; }
+#viewMode button.active { background: var(--accent); color: #08131f; border-color: var(--accent); }
+.cond-grid { display: grid; grid-template-columns: 52px 1fr 1fr; gap: 3px 6px; align-items: center; margin: 6px 0; }
+.cond-grid div { font-size: 11px; color: var(--dim); }
+.cond-grid input { width: 100%; margin: 0; }
+.btnrow { display: flex; gap: 6px; margin-top: 6px; }
+.fld { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+.fld select, .fld input { width: 100%; margin-top: 2px; }
+#pairDetail table, #rawBox table { width: 100%; border-collapse: collapse; font-size: 11px; }
+#pairDetail td, #rawBox td { padding: 2px 4px; border-bottom: 1px solid var(--line); }
+#pairDetail td:first-child { color: var(--dim); white-space: nowrap; }
+#rawBox { overflow-y: auto; max-height: 260px; font-size: 11px; }
+#rawBox h4 { margin: 6px 0 3px; font-size: 12px; }
+#spectrum .retest-line { stroke: #f0932b; stroke-width: 2; fill: none; stroke-dasharray: 6 3; }
+#spectrum circle.base-dot { fill: #4dd07a; }
+#spectrum circle.retest-dot { fill: #f0932b; }
+#spectrum text.delta { fill: #ffd75e; font-size: 8px; }
+button.mini { float: none; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button:disabled:hover { border-color: var(--line); }
