@@ -133,6 +133,9 @@ def eval_moment(field_t, segments, samples, params, keeps):
 
     返回 {amp_t, current, correction, reasons, kept, lo, hi}:
     reasons 为命中且未被保留段豁免的排除原因代码;kept 为被保留段豁免的原因。
+    采样断档分两种:两侧有样本可插值的,保留段豁免后按跨档插值换算
+    (测点有 current_a/correction,可进入覆盖计算);超出记录范围或无样本的,
+    无可换算电流,保留段也不能豁免,保持禁入。
     """
     out = {"amp_t": None, "current": None, "correction": None,
            "reasons": [], "kept": [], "lo": None, "hi": None}
@@ -147,21 +150,32 @@ def eval_moment(field_t, segments, samples, params, keeps):
     cur, lo, hi, gap = sample_current(samples, amp_t, params["max_sample_gap_s"])
     out["lo"], out["hi"] = lo, hi
     if gap:
-        out["reasons"].append("sample-gap")
-    else:
-        out["current"] = cur
-        if (lo and lo["clip"]) or (hi and hi["clip"]):
-            out["reasons"].append("clip")
-        if (lo and lo["overheat"]) or (hi and hi["overheat"]):
-            out["reasons"].append("overheat")
-        if cur is None or cur <= 0 \
-                or cur < params["calib_min_a"] - EPS or cur > params["calib_max_a"] + EPS:
-            out["reasons"].append("calib-range")
-        if cur and cur > 0:
-            corr = 20.0 * math.log10(params["ref_current_a"] / cur)
-            out["correction"] = corr
-            if abs(corr) > params["max_norm_db"] + EPS:
-                out["reasons"].append("norm-range")
+        if lo is None or hi is None:
+            # 超出记录范围或无样本:无可换算电流,保留段也不能豁免
+            out["reasons"].append("sample-gap")
+            return out
+        # 断档但两侧有样本:仅保留段豁免时才接受跨档插值
+        if not any(k["kind"] == "sample-gap" and k["t0"] - EPS <= amp_t <= k["t1"] + EPS
+                   for k in keeps):
+            out["reasons"].append("sample-gap")
+            return out
+        out["kept"].append("sample-gap")
+        span = hi["t"] - lo["t"]
+        cur = lo["current"] if span <= EPS else \
+            lo["current"] + (hi["current"] - lo["current"]) * (amp_t - lo["t"]) / span
+    out["current"] = cur
+    if (lo and lo["clip"]) or (hi and hi["clip"]):
+        out["reasons"].append("clip")
+    if (lo and lo["overheat"]) or (hi and hi["overheat"]):
+        out["reasons"].append("overheat")
+    if cur is None or cur <= 0 \
+            or cur < params["calib_min_a"] - EPS or cur > params["calib_max_a"] + EPS:
+        out["reasons"].append("calib-range")
+    if cur and cur > 0:
+        corr = 20.0 * math.log10(params["ref_current_a"] / cur)
+        out["correction"] = corr
+        if abs(corr) > params["max_norm_db"] + EPS:
+            out["reasons"].append("norm-range")
     # 保留异常段:命中保留段的对应原因豁免(仍记入 kept 供审计)
     for k in keeps:
         if k["kind"] in out["reasons"] \

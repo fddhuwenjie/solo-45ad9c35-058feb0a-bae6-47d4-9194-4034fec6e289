@@ -32,6 +32,14 @@
   </div>
 </div>
 
+<div id="snapBar" class="hidden">
+  正在查看历史修订 <b id="snapRev"></b>(只读快照,当时的锚点/保留段/测点状态)
+  <button id="btnSnapExportSvg">该修订 SVG</button>
+  <button id="btnSnapExportCsv">该修订 CSV</button>
+  <button id="btnSnapExportJson">该修订 JSON</button>
+  <button id="btnSnapBack">返回当前修订</button>
+</div>
+
 <main id="main" class="hidden">
   <aside id="left">
     <section class="panel panel">
@@ -111,6 +119,13 @@
       <label class="fld">复测 <select id="cmpRetest"></select></label>
       <button id="btnCmpCreate">新建驱动对照</button>
       <ul id="cmpList" class="list small"></ul>
+    </section>
+
+    <section class="panel">
+      <h3>历史修订(独立快照)</h3>
+      <ul id="snapList" class="list small"></ul>
+      <p class="hint">每次重算按修订号独立保存;锚点/保留段变更不覆盖旧结果,
+      历史修订可按当时的锚点与测点状态回查、导出。</p>
     </section>
 
     <section class="panel grow">

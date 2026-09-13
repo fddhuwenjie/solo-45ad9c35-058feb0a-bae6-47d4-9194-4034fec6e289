@@ -1972,7 +1972,8 @@ def bump_drive_revision(conn, did):
 
 
 def recompute_drive(conn, did):
-    """按当前功放记录/场强记录/锚点/保留段/参数重算,写 result_json。"""
+    """按当前功放记录/场强记录/锚点/保留段/参数重算,写 result_json,
+    并按当前修订号保存独立快照(历史修订结果不被覆盖,可回查/导出)。"""
     surv = get_drive(conn, did)
     proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
     bounds = json.loads(proj["bounds_json"])
@@ -1984,8 +1985,26 @@ def recompute_drive(conn, did):
     result = drive.evaluate(drive_params(surv), samples, pts,
                             drive_anchors(conn, did), drive_keeps(conn, did),
                             zones, limits, bounds)
+    result_str = json.dumps(result, ensure_ascii=False)
+    record_meta = None
+    if rec:
+        record_meta = {"id": rec["id"], "label": rec["label"],
+                       "device_id": rec["device_id"], "n_samples": len(samples),
+                       "t0": samples[0]["t"] if samples else None,
+                       "t1": samples[-1]["t"] if samples else None,
+                       "n_clip": sum(1 for s in samples if s["clip"]),
+                       "n_overheat": sum(1 for s in samples if s["overheat"])}
     conn.execute("UPDATE drive_surveys SET result_json=? WHERE id=?",
-                 (json.dumps(result, ensure_ascii=False), did))
+                 (result_str, did))
+    conn.execute(
+        "INSERT INTO drive_snapshots(survey_id,revision,result_json,samples_json,"
+        "record_json) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(survey_id,revision) DO UPDATE SET "
+        "result_json=excluded.result_json,samples_json=excluded.samples_json,"
+        "record_json=excluded.record_json,created_at=datetime('now')",
+        (did, surv["revision"], result_str,
+         json.dumps(samples, ensure_ascii=False),
+         json.dumps(record_meta, ensure_ascii=False)))
     conn.commit()
     return result
 
@@ -2010,6 +2029,13 @@ def drive_state(conn, did):
                         "ORDER BY id DESC LIMIT 60", (did,))
     for e in events:
         e["payload"] = json.loads(e.pop("payload_json"))
+    snapshots = []
+    for s in rows(conn, "SELECT revision,result_json,created_at FROM drive_snapshots "
+                        "WHERE survey_id=? ORDER BY revision DESC", (did,)):
+        st = json.loads(s["result_json"])["stats"]
+        snapshots.append({"revision": s["revision"], "created_at": s["created_at"],
+                          "n_ok": st["n_ok"], "n_excluded": st["n_excluded"],
+                          "n_points": st["n_points"]})
     return {
         "id": surv["id"], "project_id": surv["project_id"],
         "project_name": proj["name"], "project_bounds": json.loads(proj["bounds_json"]),
@@ -2021,7 +2047,7 @@ def drive_state(conn, did):
                                   "WHERE survey_id=?", (did,))["n"],
         "anchors": drive_anchors(conn, did),
         "keeps": drive_keeps(conn, did),
-        "events": events,
+        "events": events, "snapshots": snapshots,
         "created_at": surv["created_at"], "confirmed_at": surv["confirmed_at"],
         "source_record_id": surv["source_record_id"],
         "result": json.loads(surv["result_json"]) if surv["result_json"] else None,
@@ -2512,22 +2538,25 @@ def confirmed_drive(conn, did):
     return surv, json.loads(surv["result_json"])
 
 
-@app.route("/api/drive-surveys/<int:did>/export/drive.svg")
-def export_drive_svg(did):
-    conn = get_db()
-    surv, result = confirmed_drive(conn, did)
-    if not surv:
-        conn.close()
-        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
-    state = drive_state(conn, did)
-    conn.close()
-    bounds = state["project_bounds"]
-    params = state["params"]
+def drive_snapshot(conn, did, rev):
+    """读取指定修订的独立快照;不存在返回 None。"""
+    s = row(conn, "SELECT * FROM drive_snapshots WHERE survey_id=? AND revision=?",
+            (did, rev))
+    if not s:
+        return None
+    return {"revision": s["revision"], "created_at": s["created_at"],
+            "result": json.loads(s["result_json"]),
+            "samples": json.loads(s["samples_json"]),
+            "record": json.loads(s["record_json"]) if s["record_json"] else None}
 
+
+def _drive_svg_payload(surv, proj, result, revision, confirmed_at):
+    bounds = json.loads(proj["bounds_json"])
+    params = result["params"]
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.2f %.2f %.2f %.2f" '
              'font-family="sans-serif">' % (bounds["min_x"] - 4, bounds["min_y"] - 6,
                                             bounds["width"] + 8, bounds["height"] + 12)]
-    parts.append("<g opacity='0.35'>%s</g>" % svg_inner(state["venue_svg"]))
+    parts.append("<g opacity='0.35'>%s</g>" % svg_inner(proj["venue_svg"]))
     cs = result["grid"]["cs"]
     for c in result["cells"]:
         parts.append(
@@ -2558,26 +2587,17 @@ def export_drive_svg(did):
     stt = result["stats"]
     parts.append("<text x='%.2f' y='%.2f' font-size='2.4' fill='#222'>%s · %s · 修订 %d · "
                  "测点 %d(排除 %d)· 参考电流 %.2f A</text>"
-                 % (bounds["min_x"], bounds["min_y"] - 3.2, state["project_name"],
-                    state["label"], state["revision"], stt["n_points"],
+                 % (bounds["min_x"], bounds["min_y"] - 3.2, proj["name"],
+                    surv["label"], revision, stt["n_points"],
                     stt["n_excluded"], params["ref_current_a"]))
     parts.append("<text x='%.2f' y='%.2f' font-size='2.0' fill='#222'>场强已按 20·log10("
                  "I参考/I实际) 归一化 · 确认于 %s</text>"
-                 % (bounds["min_x"], bounds["min_y"] - 0.8, state["confirmed_at"] or ""))
+                 % (bounds["min_x"], bounds["min_y"] - 0.8, confirmed_at or ""))
     parts.append("</svg>")
-    return Response("".join(parts), mimetype="image/svg+xml", headers={
-        "Content-Disposition": "attachment; filename=drive_d%s_r%d.svg"
-                               % (did, state["revision"])})
+    return "".join(parts)
 
 
-@app.route("/api/drive-surveys/<int:did>/export/points.csv")
-def export_drive_csv(did):
-    conn = get_db()
-    surv, result = confirmed_drive(conn, did)
-    if not surv:
-        conn.close()
-        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
-    conn.close()
+def _drive_csv_payload(result):
     head = ["point_id", "freq_hz", "field_time", "field_t_s", "amp_t_s",
             "current_a", "ref_current_a", "correction_db",
             "sample_lo_t_s", "sample_lo_a", "sample_hi_t_s", "sample_hi_a",
@@ -2605,7 +2625,62 @@ def export_drive_csv(did):
             q(";".join(drive.reason_text(c) for c in r["kept"]))]))
     lines.append("# ref_current_a,%.3f" % ref_i)
     lines.append("# 归一化: norm_field_db = raw_field_db + 20*log10(ref_current_a/current_a)")
-    return Response("﻿" + "\n".join(lines), mimetype="text/csv", headers={
+    return "﻿" + "\n".join(lines)
+
+
+def _drive_json_payload(surv, proj, result, samples, record, revision,
+                        confirmed_at, events):
+    return {
+        "survey": {"id": surv["id"], "project_id": surv["project_id"],
+                   "project_name": proj["name"], "label": surv["label"],
+                   "status": surv["status"], "revision": revision,
+                   "created_at": surv["created_at"], "confirmed_at": confirmed_at,
+                   "source_record_id": surv["source_record_id"]},
+        "record": record,
+        "params": result["params"],
+        "anchors": result["anchors"],
+        "keeps": result["keeps"],
+        "samples": samples,
+        # 事件按修订隔离:只带入该修订及之前的记录,与快照同源
+        "events": [e for e in events if e["revision"] <= revision],
+        "result": result,
+        "nc_text": drive.NC_TEXT,
+        "normalization": "norm_field_db = raw_field_db + 20*log10(ref_current_a/current_a)",
+    }
+
+
+def _drive_events(conn, did):
+    evs = rows(conn, "SELECT * FROM drive_events WHERE survey_id=? ORDER BY id", (did,))
+    for e in evs:
+        e["payload"] = json.loads(e.pop("payload_json"))
+    return evs
+
+
+@app.route("/api/drive-surveys/<int:did>/export/drive.svg")
+def export_drive_svg(did):
+    conn = get_db()
+    surv, result = confirmed_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
+    conn.close()
+    svg = _drive_svg_payload(surv, proj, result, surv["revision"],
+                             surv["confirmed_at"])
+    return Response(svg, mimetype="image/svg+xml", headers={
+        "Content-Disposition": "attachment; filename=drive_d%s_r%d.svg"
+                               % (did, surv["revision"])})
+
+
+@app.route("/api/drive-surveys/<int:did>/export/points.csv")
+def export_drive_csv(did):
+    conn = get_db()
+    surv, result = confirmed_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
+    conn.close()
+    return Response(_drive_csv_payload(result), mimetype="text/csv", headers={
         "Content-Disposition": "attachment; filename=drive_points_d%s_r%d.csv"
                                % (did, surv["revision"])})
 
@@ -2617,26 +2692,108 @@ def export_drive_json(did):
     if not surv:
         conn.close()
         return json_error("校审尚未确认,三份导出材料必须取自同一确认结果", 409)
-    state = drive_state(conn, did)
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
+    rec = drive_record(conn, did)
+    samples = drive_samples(conn, rec["id"]) if rec else []
+    record = None
+    if rec:
+        record = {"id": rec["id"], "label": rec["label"],
+                  "device_id": rec["device_id"], "n_samples": len(samples),
+                  "t0": samples[0]["t"] if samples else None,
+                  "t1": samples[-1]["t"] if samples else None,
+                  "n_clip": sum(1 for s in samples if s["clip"]),
+                  "n_overheat": sum(1 for s in samples if s["overheat"])}
+    payload = _drive_json_payload(surv, proj, result, samples, record,
+                                  surv["revision"], surv["confirmed_at"],
+                                  _drive_events(conn, did))
     conn.close()
-    payload = {
-        "survey": {k: state[k] for k in
-                   ("id", "project_id", "project_name", "label", "status", "revision",
-                    "created_at", "confirmed_at", "source_record_id")},
-        "record": state["record"],
-        "params": state["params"],
-        "anchors": state["anchors"],
-        "keeps": state["keeps"],
-        "samples": state["samples"],
-        "events": state["events"],
-        "result": result,
-        "nc_text": drive.NC_TEXT,
-        "normalization": "norm_field_db = raw_field_db + 20*log10(ref_current_a/current_a)",
-    }
     return Response(json.dumps(payload, ensure_ascii=False, indent=1),
                     mimetype="application/json", headers={
                         "Content-Disposition": "attachment; filename=drive_recalc_d%s_r%d.json"
-                                               % (did, state["revision"])})
+                                               % (did, surv["revision"])})
+
+
+# ---------------- 历史修订回查 / 导出(按修订独立快照)
+
+@app.route("/api/drive-surveys/<int:did>/revisions/<int:rev>")
+def get_drive_revision(did, rev):
+    """回查历史修订:当时的锚点、保留段、测点状态与结果(只读快照)。"""
+    conn = get_db()
+    surv = get_drive(conn, did)
+    if not surv:
+        conn.close()
+        return json_error("驱动基准校审不存在", 404)
+    snap = drive_snapshot(conn, did, rev)
+    conn.close()
+    if not snap:
+        return json_error("修订 %d 无结果快照" % rev, 404)
+    return jsonify({
+        "survey_id": did, "revision": rev, "current_revision": surv["revision"],
+        "status": surv["status"], "label": surv["label"],
+        "created_at": snap["created_at"], "record": snap["record"],
+        "samples": snap["samples"], "result": snap["result"],
+        "nc_text": drive.NC_TEXT, "keep_kinds": drive.KEEP_KINDS,
+    })
+
+
+def _revision_export(conn, did, rev):
+    """历史修订导出的公共校验。返回 (surv, proj, snap) 或 (None, None, error)。"""
+    surv = get_drive(conn, did)
+    if not surv:
+        return None, None, (json_error("驱动基准校审不存在", 404))
+    snap = drive_snapshot(conn, did, rev)
+    if not snap:
+        return None, None, (json_error("修订 %d 无结果快照" % rev, 404))
+    if rev == surv["revision"] and surv["status"] != "confirmed":
+        return None, None, (json_error(
+            "当前修订尚未确认,三份导出材料必须取自同一确认结果", 409))
+    proj = row(conn, "SELECT * FROM projects WHERE id=?", (surv["project_id"],))
+    return surv, proj, snap
+
+
+@app.route("/api/drive-surveys/<int:did>/revisions/<int:rev>/export/drive.svg")
+def export_drive_revision_svg(did, rev):
+    conn = get_db()
+    surv, proj, snap = _revision_export(conn, did, rev)
+    if not surv:
+        conn.close()
+        return snap
+    confirmed_at = surv["confirmed_at"] if rev == surv["revision"] else None
+    svg = _drive_svg_payload(surv, proj, snap["result"], rev, confirmed_at)
+    conn.close()
+    return Response(svg, mimetype="image/svg+xml", headers={
+        "Content-Disposition": "attachment; filename=drive_d%s_r%d.svg" % (did, rev)})
+
+
+@app.route("/api/drive-surveys/<int:did>/revisions/<int:rev>/export/points.csv")
+def export_drive_revision_csv(did, rev):
+    conn = get_db()
+    surv, proj, snap = _revision_export(conn, did, rev)
+    if not surv:
+        conn.close()
+        return snap
+    conn.close()
+    return Response(_drive_csv_payload(snap["result"]), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=drive_points_d%s_r%d.csv"
+                               % (did, rev)})
+
+
+@app.route("/api/drive-surveys/<int:did>/revisions/<int:rev>/export/recalc.json")
+def export_drive_revision_json(did, rev):
+    conn = get_db()
+    surv, proj, snap = _revision_export(conn, did, rev)
+    if not surv:
+        conn.close()
+        return snap
+    confirmed_at = surv["confirmed_at"] if rev == surv["revision"] else None
+    payload = _drive_json_payload(surv, proj, snap["result"], snap["samples"],
+                                  snap["record"], rev, confirmed_at,
+                                  _drive_events(conn, did))
+    conn.close()
+    return Response(json.dumps(payload, ensure_ascii=False, indent=1),
+                    mimetype="application/json", headers={
+                        "Content-Disposition": "attachment; filename=drive_recalc_d%s_r%d.json"
+                                               % (did, rev)})
 
 
 if __name__ == "__main__":

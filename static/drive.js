@@ -27,6 +27,7 @@ let D = null;               // 当前校审状态
 let compares = [];
 let selPoint = null;        // 选中测点 label
 let pan = null;
+let snapView = null;        // 正在查看的历史修订快照(null = 当前修订)
 
 const viewport = $("#viewport");
 const chart = $("#currentChart");
@@ -80,9 +81,15 @@ function ncReason(code) {
   return arg ? t + "(" + arg + ")" : t;
 }
 
+/* 快照查看时,结果相关渲染一律取快照数据(锚点/保留段/测点状态均为当时值) */
+function effResult() { return snapView ? snapView.result : (D && D.result); }
+function effSamples() { return snapView ? snapView.samples : (D ? D.samples : []); }
+function effAnchors() { return snapView ? snapView.result.anchors : (D ? D.anchors : []); }
+function effKeeps() { return snapView ? snapView.result.keeps : (D ? D.keeps : []); }
+function effRecord() { return snapView ? snapView.record : (D ? D.record : null); }
 function result() { return D && D.result; }
-function points() { const r = result(); return r ? r.points : []; }
-function locked() { return D && D.status === "confirmed"; }
+function points() { const r = effResult(); return r ? r.points : []; }
+function locked() { return (D && D.status === "confirmed") || !!snapView; }
 function fmtDb(v) { return v == null ? "—" : (+v).toFixed(1); }
 
 /* ---------------------------------------------------------------- 初始化 */
@@ -124,6 +131,7 @@ async function refreshSurveyList(selectId) {
 
 async function loadSurvey(did) {
   D = await api("/api/drive-surveys/" + did);
+  snapView = null;
   selPoint = null;
   renderAll();
 }
@@ -142,6 +150,7 @@ function renderAll() {
   renderKeeps();
   renderParams();
   renderEvents();
+  renderSnapList();
   renderStats();
   renderPointList();
   renderDetail();
@@ -154,13 +163,19 @@ function renderAll() {
 function renderHeader() {
   const b = $("#drvBadge");
   if (!D) { b.textContent = ""; return; }
-  b.textContent = (locked() ? "已确认 · " : "草稿 · ") + "修订 " + D.revision;
-  b.classList.toggle("mixed", locked());
-  $("#btnConfirm").classList.toggle("hidden", locked());
-  $("#btnReopen").classList.toggle("hidden", !locked());
+  b.textContent = (D.status === "confirmed" ? "已确认 · " : "草稿 · ") +
+    "修订 " + D.revision + (snapView ? "(查看历史 " + snapView.revision + ")" : "");
+  b.classList.toggle("mixed", D.status === "confirmed" && !snapView);
+  $("#btnConfirm").classList.toggle("hidden", D.status === "confirmed" || !!snapView);
+  $("#btnReopen").classList.toggle("hidden", D.status !== "confirmed" || !!snapView);
+  $("#snapBar").classList.toggle("hidden", !snapView);
+  if (snapView) $("#snapRev").textContent = "修订 " + snapView.revision;
+  const canExport = snapView || D.status === "confirmed";
   for (const id of ["#btnExpSvg", "#btnExpCsv", "#btnExpJson"]) {
-    $(id).disabled = !locked();
-    $(id).title = locked() ? "导出(取自确认结果)" : "确认结果后才能导出(三份材料同源)";
+    $(id).disabled = !canExport;
+    $(id).title = snapView ? "导出当前查看的历史修订快照"
+      : D.status === "confirmed" ? "导出(取自确认结果)"
+      : "确认结果后才能导出(三份材料同源)";
   }
   for (const id of ["#btnImportRec", "#btnImportPts", "#btnAnchor", "#btnKeep",
                     "#btnSaveParams", "#btnCreate"]) $(id).disabled = locked();
@@ -183,7 +198,7 @@ function renderViewport() {
     if (root) for (const n of [...root.childNodes]) gVenue.appendChild(document.importNode(n, true));
   } catch (e) { /* 底图解析失败不阻断 */ }
 
-  const r = result();
+  const r = effResult();
   if (r) {
     const gCells = el("g", {}, viewport);
     const cs = r.grid.cs;
@@ -227,12 +242,11 @@ function renderLegend() {
 
 function chartRange() {
   const ts = [], cs = [];
-  if (D && D.record) {
-    if (D.record.t0 != null) ts.push(D.record.t0, D.record.t1);
-  }
-  for (const a of (D ? D.anchors : [])) ts.push(a.amp_t);
+  const rec = effRecord();
+  if (rec && rec.t0 != null) ts.push(rec.t0, rec.t1);
+  for (const a of effAnchors()) ts.push(a.amp_t);
   for (const p of points()) if (p.amp_t != null) ts.push(p.amp_t);
-  for (const s of (D ? D.samples : [])) cs.push(s.current);
+  for (const s of effSamples()) cs.push(s.current);
   if (D) cs.push(D.params.ref_current_a, D.params.calib_min_a, D.params.calib_max_a);
   for (const p of points()) if (p.current_a != null) cs.push(p.current_a);
   const t0 = ts.length ? Math.min(...ts) : 0, t1 = ts.length ? Math.max(...ts) : 100;
@@ -243,14 +257,16 @@ function chartRange() {
 function drawChart() {
   chart.innerHTML = "";
   const W = 380, H = 240, Lm = 42, Rm = 8, T = 10, B = 30;
-  $("#chartTitle").textContent = D && D.record ? esc(D.record.label) : "";
-  if (!D || !D.samples.length) {
+  const rec = effRecord();
+  $("#chartTitle").textContent = rec ? esc(rec.label) : "";
+  const samples = effSamples();
+  if (!D || !samples.length) {
     const t = el("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }, chart);
     t.textContent = "导入功放记录与锚点后显示电流曲线与测点映射";
     return;
   }
   const [t0, t1, c0, c1] = chartRange();
-  const P = D.params;
+  const P = effResult() ? effResult().params : D.params;
   const xs = (t) => Lm + (t - t0) / (t1 - t0) * (W - Lm - Rm);
   const ys = (c) => T + (c1 - c) / (c1 - c0) * (H - T - B);
 
@@ -259,7 +275,7 @@ function drawChart() {
     height: Math.max(1, ys(P.calib_min_a) - ys(Math.min(P.calib_max_a, c1))),
     fill: "rgba(46,158,91,.10)" }, chart);
   // 采样断档红带
-  for (const g of (result()?.samples_summary.gaps || []))
+  for (const g of (effResult()?.samples_summary.gaps || []))
     el("rect", { x: xs(g.t0), y: T, width: Math.max(1.5, xs(g.t1) - xs(g.t0)),
       height: H - T - B, fill: "rgba(210,64,64,.14)" }, chart)
       .appendChild(document.createElementNS(SVGNS, "title"))
@@ -286,9 +302,9 @@ function drawChart() {
   rt.textContent = "参考 " + P.ref_current_a + " A";
 
   // 电流曲线 + 告警点
-  el("polyline", { points: D.samples.map(s => xs(s.t) + "," + ys(s.current)).join(" "),
+  el("polyline", { points: samples.map(s => xs(s.t) + "," + ys(s.current)).join(" "),
     class: "field-line" }, chart);
-  for (const s of D.samples) {
+  for (const s of samples) {
     if (s.clip) el("circle", { cx: xs(s.t), cy: ys(s.current), r: 2.6,
       fill: "#d24040" }, chart)
       .appendChild(document.createElementNS(SVGNS, "title"))
@@ -299,7 +315,7 @@ function drawChart() {
       .textContent = "过热 @ " + fmtClock(s.t);
   }
   // 锚点竖线
-  D.anchors.forEach((a, i) => {
+  effAnchors().forEach((a, i) => {
     el("line", { x1: xs(a.amp_t), y1: T, x2: xs(a.amp_t), y2: H - B,
       stroke: "#4da3ff", "stroke-width": 0.7, "stroke-dasharray": "3 2" }, chart);
     const t = el("text", { x: xs(a.amp_t) + 1.5, y: T + 8 + (i % 3) * 8,
@@ -331,12 +347,14 @@ function drawChart() {
 function renderRecord() {
   const info = $("#recInfo");
   if (!D) { info.textContent = ""; return; }
-  if (!D.record) { info.textContent = "尚未导入功放记录"; return; }
-  const r = D.record;
+  const rec = effRecord();
+  if (!rec) { info.textContent = "尚未导入功放记录"; return; }
   info.innerHTML = "";
   info.appendChild(document.createTextNode(
-    r.label + " · " + r.n_samples + " 样本 · " + fmtClock(r.t0) + "–" + fmtClock(r.t1) +
-    " · 削波 " + r.n_clip + " / 过热 " + r.n_overheat + (locked() ? " · 已锁定" : "")));
+    rec.label + " · " + rec.n_samples + " 样本 · " + fmtClock(rec.t0) +
+    "–" + fmtClock(rec.t1) +
+    " · 削波 " + rec.n_clip + " / 过热 " + rec.n_overheat +
+    (locked() ? " · 已锁定" : "")));
   if (!locked()) {
     const del = document.createElement("span");
     del.className = "del"; del.textContent = " ✕删除";
@@ -356,8 +374,9 @@ function renderAnchors() {
   const ul = $("#anchorList");
   ul.innerHTML = "";
   if (!D) return;
-  if (!D.anchors.length) ul.innerHTML = "<li class='dim'>尚未绑定锚点(至少 2 个)</li>";
-  D.anchors.forEach((a, i) => {
+  const anchors = effAnchors();
+  if (!anchors.length) ul.innerHTML = "<li class='dim'>尚未绑定锚点(至少 2 个)</li>";
+  anchors.forEach((a, i) => {
     const li = document.createElement("li");
     li.innerHTML = "<span class='tag'>锚" + (i + 1) + "</span>功放 " + fmtClock(a.amp_t) +
       " ↔ 场强 " + fmtClock(a.field_t) +
@@ -374,8 +393,8 @@ function renderAnchors() {
     });
     ul.appendChild(li);
   });
-  const mp = result()?.mapping;
-  if (mp && D.anchors.length >= 2)
+  const mp = effResult()?.mapping;
+  if (mp && anchors.length >= 2)
     $("#anchorList").insertAdjacentHTML("beforeend",
       "<li class='" + (mp.ok ? "dim" : "issue") + "'>分段映射 " + mp.segments.length +
       " 段" + (mp.ok ? " · 单调有效" : " · ⚠ 存在映射倒退段") + "</li>");
@@ -385,8 +404,9 @@ function renderKeeps() {
   const ul = $("#keepList");
   ul.innerHTML = "";
   if (!D) return;
-  if (!D.keeps.length) ul.innerHTML = "<li class='dim'>暂无保留段</li>";
-  for (const k of D.keeps) {
+  const keeps = effKeeps();
+  if (!keeps.length) ul.innerHTML = "<li class='dim'>暂无保留段</li>";
+  for (const k of keeps) {
     const li = document.createElement("li");
     li.innerHTML = "<span class='tag'>" + (KEEP_TEXT[k.kind] || k.kind) + "</span>" +
       fmtClock(k.t0) + "–" + fmtClock(k.t1) +
@@ -435,8 +455,9 @@ function renderEvents() {
 
 function renderStats() {
   const box = $("#stats");
-  if (!D || !result()) { box.innerHTML = "<span class='dim'>尚未计算</span>"; return; }
-  const s = result().stats;
+  const r = effResult();
+  if (!D || !r) { box.innerHTML = "<span class='dim'>尚未计算</span>"; return; }
+  const s = r.stats;
   const chips = [
     ["#1c6dd9", "进入覆盖 " + s.n_ok],
     ["#9b59b6", "排除 " + s.n_excluded],
@@ -445,17 +466,52 @@ function renderStats() {
   ];
   for (const [code, n] of Object.entries(s.reasons))
     chips.push(["#9b59b6", ncReason(code) + " " + n]);
-  if (result().samples_summary.gaps.length)
-    chips.push(["#d24040", "断档 " + result().samples_summary.gaps.length + " 处"]);
+  if (r.samples_summary.gaps.length)
+    chips.push(["#d24040", "断档 " + r.samples_summary.gaps.length + " 处"]);
   box.innerHTML = "<div class='chips'>" + chips.map(c =>
     "<span class='chip' style='background:" + c[0] + "'>" + c[1] + "</span>").join("") +
     "</div>" + (s.map_ok ? "" : "<p class='issue'>时码映射无效或存在倒退段</p>");
 }
 
+function renderSnapList() {
+  const ul = $("#snapList");
+  ul.innerHTML = "";
+  if (!D) return;
+  const snaps = D.snapshots || [];
+  if (!snaps.length) { ul.innerHTML = "<li class='dim'>暂无快照</li>"; return; }
+  for (const s of snaps) {
+    const li = document.createElement("li");
+    const cur = s.revision === D.revision;
+    if (snapView && snapView.revision === s.revision) li.classList.add("sel");
+    li.innerHTML = "<span class='tag'>修订" + s.revision + "</span>" +
+      "合格 " + s.n_ok + " / 排除 " + s.n_excluded +
+      (cur ? "<span class='tag'>当前</span>" : "") +
+      "<span class='dim' style='margin-left:auto'>" + s.created_at.slice(5, 16) + "</span>";
+    li.title = cur ? "当前修订" : "点击查看该修订的只读快照";
+    li.onclick = () => { if (!cur) viewSnapshot(s.revision); else backToCurrent(); };
+    ul.appendChild(li);
+  }
+}
+
+async function viewSnapshot(rev) {
+  snapView = await api("/api/drive-surveys/" + D.id + "/revisions/" + rev);
+  selPoint = null;
+  renderAll();
+  status("正在查看历史修订 " + rev + " 的只读快照(锚点/保留段/测点状态均为当时值)");
+}
+
+function backToCurrent() {
+  if (!snapView) return;
+  snapView = null;
+  selPoint = null;
+  renderAll();
+  status("已返回当前修订 " + D.revision);
+}
+
 function renderPointList() {
   const ul = $("#pointList");
   ul.innerHTML = "";
-  if (!D || !result()) return;
+  if (!D || !effResult()) return;
   const ps = points();
   $("#ptCount").textContent = "(" + ps.length + ")";
   for (const p of ps) {
@@ -476,7 +532,7 @@ function renderPointList() {
 
 function renderDetail() {
   const box = $("#detail");
-  if (!D || !result()) { box.innerHTML = "<p class='dim'>在座位图或时间曲线上点击测点</p>"; return; }
+  if (!D || !effResult()) { box.innerHTML = "<p class='dim'>在座位图或时间曲线上点击测点</p>"; return; }
   const p = points().find(q => q.label === selPoint);
   if (!p) { box.innerHTML = "<p class='dim'>在座位图或时间曲线上点击测点</p>"; return; }
   let html = "<table>" +
@@ -623,6 +679,7 @@ async function importCsv(fileInput, url, labelInput) {
   fd.append("csv", f);
   if (labelInput && $(labelInput).value) fd.append("label", $(labelInput).value);
   D = await api(url, { method: "POST", body: fd });
+  snapView = null;
   const r = D.import_result;
   status("已导入 " + r.rows + " 行,已重算" +
     (r.csv_errors.length ? ";CSV 警告 " + r.csv_errors.length + " 条" : ""));
@@ -644,6 +701,7 @@ $("#btnAnchor").onclick = async () => {
     body: JSON.stringify({ amp_t: $("#ancAmp").value.trim(),
       field_t: $("#ancField").value.trim(), note }),
   });
+  snapView = null;
   $("#ancAmp").value = $("#ancField").value = $("#ancNote").value = "";
   status("锚点已绑定,已切换至修订 " + D.revision);
   renderAll();
@@ -657,6 +715,7 @@ $("#btnKeep").onclick = async () => {
     body: JSON.stringify({ kind: $("#keepKind").value,
       t0: $("#keepT0").value.trim(), t1: $("#keepT1").value.trim(), note }),
   });
+  snapView = null;
   $("#keepT0").value = $("#keepT1").value = $("#keepNote").value = "";
   status("保留段已记录,已切换至修订 " + D.revision);
   renderAll();
@@ -668,6 +727,7 @@ $("#btnSaveParams").onclick = async () => {
   D = await api("/api/drive-surveys/" + D.id + "/params", {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data),
   });
+  snapView = null;
   status("判定参数已保存,已重算");
   renderAll();
 };
@@ -675,6 +735,7 @@ $("#btnSaveParams").onclick = async () => {
 $("#btnConfirm").onclick = async () => {
   try {
     D = await api("/api/drive-surveys/" + D.id + "/confirm", { method: "POST" });
+    snapView = null;
     status("校审已确认:记录、锚点、保留段与参数已锁定,可导出三份材料");
     renderAll(); refreshSurveyList(D.id);
   } catch (e) { /* 已提示 */ }
@@ -687,6 +748,7 @@ $("#btnReopen").onclick = async () => {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ note }),
   });
+  snapView = null;
   status("已解除锁定,修订号 +1;调整后请重新确认");
   renderAll(); refreshSurveyList(D.id);
 };
@@ -703,8 +765,18 @@ $("#btnCmpCreate").onclick = async () => {
   } catch (e) { /* 已提示 */ }
 };
 
-$("#btnExpSvg").onclick = () => D && (location = "/api/drive-surveys/" + D.id + "/export/drive.svg");
-$("#btnExpCsv").onclick = () => D && (location = "/api/drive-surveys/" + D.id + "/export/points.csv");
-$("#btnExpJson").onclick = () => D && (location = "/api/drive-surveys/" + D.id + "/export/recalc.json");
+function exportUrl(kind) {
+  if (snapView)
+    return "/api/drive-surveys/" + D.id + "/revisions/" + snapView.revision + "/export/" + kind;
+  return "/api/drive-surveys/" + D.id + "/export/" + kind;
+}
+
+$("#btnExpSvg").onclick = () => D && (location = exportUrl("drive.svg"));
+$("#btnExpCsv").onclick = () => D && (location = exportUrl("points.csv"));
+$("#btnExpJson").onclick = () => D && (location = exportUrl("recalc.json"));
+$("#btnSnapExportSvg").onclick = () => snapView && (location = exportUrl("drive.svg"));
+$("#btnSnapExportCsv").onclick = () => snapView && (location = exportUrl("points.csv"));
+$("#btnSnapExportJson").onclick = () => snapView && (location = exportUrl("recalc.json"));
+$("#btnSnapBack").onclick = backToCurrent;
 
 boot();

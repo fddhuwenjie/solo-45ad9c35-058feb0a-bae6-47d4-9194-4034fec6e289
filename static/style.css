@@ -130,6 +130,12 @@ aside { width: 265px; overflow-y: auto; padding: 8px; display: flex; flex-direct
   padding: 5px 14px; background: rgba(210,64,64,.16); color: #ff9a9a;
   border-bottom: 1px solid var(--fail); font-size: 12px;
 }
+#snapBar {
+  padding: 5px 14px; background: rgba(77,163,255,.12); color: #9cc8ff;
+  border-bottom: 1px solid var(--accent); font-size: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+#snapBar.hidden { display: none; }
 #viewMode {
   position: absolute; right: 10px; top: 10px; display: flex; gap: 4px;
   background: rgba(20,23,28,.88); border: 1px solid var(--line); border-radius: 6px; padding: 4px;

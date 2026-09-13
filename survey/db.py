@@ -1,6 +1,7 @@
 """SQLite 持久化:项目、巡测版本、测量行、分区、限值、网格缓存、人工决定、
 复测对照,边界外逸工作区(测次/测点/环区/保密边界/改配/修订事件),
-以及驱动基准工作区(功放记录/电流样本/场强记录/时钟锚点/保留段/修订事件/对照)。"""
+以及驱动基准工作区(功放记录/电流样本/场强记录/时钟锚点/保留段/修订事件/
+按修订独立保存的结果快照/对照)。"""
 import os
 import sqlite3
 
@@ -257,6 +258,18 @@ CREATE TABLE IF NOT EXISTS drive_events(
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at TEXT DEFAULT (datetime('now'))
+);
+-- 每次重算按当前修订号保存独立快照:锚点/保留段变更不覆盖旧结果,
+-- 历史修订可按当时的锚点、测点状态与结果回查、导出
+CREATE TABLE IF NOT EXISTS drive_snapshots(
+  id INTEGER PRIMARY KEY,
+  survey_id INTEGER NOT NULL REFERENCES drive_surveys(id),
+  revision INTEGER NOT NULL,
+  result_json TEXT NOT NULL,      -- evaluate() 的完整结果(含锚点/保留段/逐点状态)
+  samples_json TEXT NOT NULL,     -- 当时功放记录电流样本(追溯用)
+  record_json TEXT,               -- 当时功放记录元信息
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(survey_id, revision)
 );
 CREATE TABLE IF NOT EXISTS drive_compares(
   id INTEGER PRIMARY KEY,

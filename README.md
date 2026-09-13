@@ -104,3 +104,44 @@ GET  /api/leak-surveys/<id>/export/boundary.svg | remeasure.csv | recalc.json
 ```
 
 回归:`python3 regression_leak.py`。
+
+## 驱动基准工作区(`/drive`)
+
+一次剧场巡测常要走上几十分钟,功放可能限幅、过热或输入电平改变而输出漂移;
+若把各时刻读数当作同一驱动条件,弱场区可能只是当时环路电流下降。本工作区
+用**带时标的环路电流记录**把场强读数归一化到同一驱动基准:
+
+1. **功放记录**:上传 `time,current_a[,clip][,overheat]` CSV(时标支持秒数、
+   HH:MM[:SS]、ISO 日期时间);
+2. **场强记录**:上传 `point_id,x,y,freq_hz,field_db,noise_db,time[,device_id][,calib_version]`;
+3. **时钟锚点**:为功放时钟与场强时钟绑定若干对应时刻(换绑必须备注理由,
+   形成新修订),按锚点生成分段时码映射;座位图与电流时间曲线联动核对绑定;
+4. **归一化**:测点按映射归入电流区间取插值电流,以冻结的参考电流换算
+   `校正值 dB = 20·log10(I参考/I实际)`;原始读数始终并列展示。
+
+以下情形相应测点**不得进入覆盖计算**(座位图紫点,原因明示):
+映射倒退、采样断档、削波、过热、校准量程不足、归一化幅度越限、超出锚点范围。
+削波/过热/断档可用**保留异常段**豁免(必须备注理由,形成新修订):
+断档保留后若两侧有样本,按跨档插值换算,测点有 `current_a`/`norm_ref_db`
+并进入对应网格;若超出记录范围无可换算电流,保留段也不能豁免,仍禁入。
+
+**修订快照**:每次重算按当前修订号独立保存结果快照(含当时的锚点、保留段、
+测点状态与电流样本),锚点/保留段变更不覆盖旧结果;历史修订可在左栏
+「历史修订」面板回查(只读),并以 `/revisions/<rev>/export/...` 导出当时的
+SVG/CSV/JSON。复测对照只能引用**已确认**的驱动版本(冻结结果逐点比对)。
+
+```
+POST /api/projects/<pid>/drive-surveys            建校审
+POST /api/drive-surveys/<id>/record | /points     导入功放记录 / 场强记录(CSV)
+POST /api/drive-surveys/<id>/anchors              绑定锚点(备注,新修订)
+DELETE /api/drive-anchors/<id>                    删除锚点(备注,新修订)
+POST /api/drive-surveys/<id>/keeps                保留异常段(备注,新修订)
+PUT  /api/drive-surveys/<id>/params               参考电流/断档/归一化限值/校准量程
+POST /api/drive-surveys/<id>/confirm | /reopen    确认锁定 / 重审(修订+1)
+GET  /api/drive-surveys/<id>/revisions/<rev>      历史修订快照回查
+GET  /api/drive-surveys/<id>/export/drive.svg | points.csv | recalc.json
+GET  /api/drive-surveys/<id>/revisions/<rev>/export/...   历史修订导出
+POST /api/projects/<pid>/drive-compares           复测对照(仅已确认版本)
+```
+
+回归:`python3 regression_drive.py`。
